@@ -152,6 +152,7 @@ let algId = 'astar', pathMode = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
 let selectedObstacle = null;
 let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
+let replanning = false; /* 重规划进行中:车沿旧轨迹巡航不停车 */
 function algoStart(){ return dynamicStart || start; }
 let lastT = performance.now(), acc = 0, lastMetricsRender = 0;
 let vw = 0, vh = 0;
@@ -1645,9 +1646,19 @@ function startSearch(){
   algo = createAlgorithm(algId);
   const ok = algo.init();
   if (ok === false){
-    actionText(algo.failReason || '无法开始搜索');
+    // 移动障碍可能暂时占据起点/终点格:自动重试等其移开
+    actionText(algo.failReason + ',自动重试…');
+    if (window.__startRetry === undefined) window.__startRetry = 0;
+    if (window.__startRetry < 6){
+      window.__startRetry++;
+      setTimeout(() => { window.__startRetry--; if (mode === 'idle') startSearch(); }, 500);
+    } else {
+      window.__startRetry = 0;
+      actionText(algo.failReason + ',请移动障碍物后重试');
+    }
     return;
   }
+  window.__startRetry = 0;
   metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
   mode = 'searching'; running = true;
   renderMetrics();
@@ -1669,20 +1680,63 @@ function afterSearchDone(){
   }
   visPathFromAlgo();
   let pts = algo.path;
+  if (dynamicStart && algo.path.length >= 2){
+    // 重规划:车在搜索期间已前进,以当前位置为新路径起点,跳过车后方的点(避免往回走)
+    const vx = algo.path[1].x - algo.path[0].x, vy = algo.path[1].y - algo.path[0].y;
+    const rx = car.x - algo.path[0].x, ry = car.y - algo.path[0].y;
+    if (vx*rx + vy*ry > 0){ /* 车在路径前进方向一侧 */
+      let si = 1, bd = Infinity;
+      for (let i=1;i<algo.path.length;i++){
+        const d = Math.hypot(algo.path[i].x-car.x, algo.path[i].y-car.y);
+        if (d < bd){ bd = d; si = i; }
+      }
+      pts = [ {x:car.x, y:car.y} ].concat(algo.path.slice(si));
+    }
+  }
   if (pathMode === 'spline' && pts.length >= 2) pts = buildSpline(pts);
   tracker = { pts, idx:0 };
   if (!algo.replanRun && !dynamicStart) resetCarToStart();
   else if (algo.path.length && vehicleCollides(car, world.obstacles)){
-    car.x = algo.path[0].x; car.y = algo.path[0].y;
-    if (algo.path.length > 1) car.theta = Math.atan2(algo.path[1].y-algo.path[0].y, algo.path[1].x-algo.path[0].x);
+    // 车卡在障碍内:贴到路径上离车最近的点(避免视角回跳)
+    let bi = 0, bd = Infinity;
+    for (let i=0;i<algo.path.length;i++){
+      const d = Math.hypot(algo.path[i].x-car.x, algo.path[i].y-car.y);
+      if (d < bd){ bd = d; bi = i; }
+    }
+    car.x = algo.path[bi].x; car.y = algo.path[bi].y;
+    if (bi < algo.path.length-1) car.theta = Math.atan2(algo.path[bi+1].y-algo.path[bi].y, algo.path[bi+1].x-algo.path[bi].x);
   }
   car.v = 0; car.delta = 0; car.collided = false;
   metricsLive = { alg:algo.name, pathLen:algo.metrics.pathLen, expanded:algo.metrics.expanded, timeMs:algo.metrics.timeMs, collisions:0 };
-  mode = 'following'; running = true;
+  mode = 'following'; running = true; replanning = false;
   renderMetrics();
   actionText('小车沿路径行驶…');
 }
 let lastReplanT = 0;
+let lastGridCheckT = 0;
+let lastObstacleCells = new Set();
+function obstacleCells(){
+  const s = new Set();
+  for (const o of world.obstacles){
+    if (!(o.vel || (o.patrol && o.patrol.length >= 2))) continue;
+    const x0 = Math.floor((o.x - CLEAR)/GRID), x1 = Math.floor((o.x+o.w+CLEAR)/GRID);
+    const y0 = Math.floor((o.y - CLEAR)/GRID), y1 = Math.floor((o.y+o.h+CLEAR)/GRID);
+    for (let y=y0;y<=y1;y++) for (let x=x0;x<=x1;x++) s.add(x+','+y);
+  }
+  return s;
+}
+function gridChangedByMoving(){
+  const now = performance.now();
+  if (now - lastGridCheckT < 3000) return false;
+  lastGridCheckT = now;
+  const cells = obstacleCells();
+  let changed = cells.size !== lastObstacleCells.size;
+  if (!changed){
+    for (const k of cells){ if (!lastObstacleCells.has(k)){ changed = true; break; } }
+  }
+  lastObstacleCells = cells;
+  return changed;
+}
 function segmentHitsObstacle(a, b){
   const d = Math.hypot(b.x-a.x, b.y-a.y);
   const n = Math.max(1, Math.ceil(d/8));
@@ -1695,13 +1749,6 @@ function segmentHitsObstacle(a, b){
   }
   return false;
 }
-function pathBlockedByObstacles(){
-  if (!tracker || tracker.pts.length < 2) return false;
-  for (let i = Math.max(0, tracker.idx); i < tracker.pts.length - 1; i++){
-    if (segmentHitsObstacle(tracker.pts[i], tracker.pts[i+1])) return true;
-  }
-  return false;
-}
 function frontBlocked(dist){
   if (!tracker || tracker.pts.length < 2) return false;
   for (let i = Math.max(0, tracker.idx); i < tracker.pts.length - 1; i++){
@@ -1710,10 +1757,10 @@ function frontBlocked(dist){
   }
   return false;
 }
-function tryReplan(){
+function tryReplan(force){
   const now = performance.now();
   if (now - lastReplanT < 500) return;
-  if (!pathBlockedByObstacles()) return;
+  if (!force && !frontBlocked(600)) return;
   lastReplanT = now;
   if (!algo) return;
   if (algo.id === 'dlite' && algo.hasPlan){
@@ -1724,7 +1771,7 @@ function tryReplan(){
     if (!changed.length) return;
     algo.blockedBefore = after;
     algo.replan(changed);
-    mode = 'searching'; running = true;
+    mode = 'searching'; running = true; replanning = true;
     actionText('D* Lite:移动障碍触发增量重规划…');
     return;
   }
@@ -1733,13 +1780,27 @@ function tryReplan(){
   algo = createAlgorithm(algId);
   const ok = algo.init();
   if (ok === false){
-    dynamicStart = null;
+    dynamicStart = null; replanning = false;
     actionText('重新规划失败:' + (algo.failReason || '未知原因'));
     return;
   }
   metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
-  mode = 'searching'; running = true;
+  mode = 'searching'; running = true; replanning = true;
   actionText(algo.name+':检测到移动障碍,重新规划路径…');
+}
+function handleCarCollision(){
+  const hitMoving = world.obstacles.some(o =>
+    (o.vel || (o.patrol && o.patrol.length >= 2)) && obbRectHit(car.x, car.y, car.theta, o, HIT_L, HIT_W));
+  if (hitMoving){
+    // 被移动障碍挡住:不算失败,立即重规划绕行
+    lastReplanT = 0;
+    actionText('被移动障碍挡住,重新规划绕行…');
+    return true;
+  }
+  car.collided = true;
+  metricsLive.collisions++;
+  fail('小车碰撞到障碍物', true);
+  return false;
 }
 function followStep(dt){
   const dt2 = dt*speedMult;
@@ -1750,16 +1811,16 @@ function followStep(dt){
     const dG = dist(car, goal);
     let sp = +speedRange.value;
     if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
-    if (moveChk.checked && frontBlocked(150)) sp *= 0.25;
     car.v = sp;
     car.delta = trackerSteer();
   }
   carStep(car, dt2);
-  if (mode === 'following' && moveChk.checked) tryReplan();
+  if (mode === 'following' && moveChk.checked){
+    tryReplan(false);
+    if (gridChangedByMoving()) tryReplan(true);
+  }
   if (vehicleCollides(car, world.obstacles)){
-    car.collided = true;
-    metricsLive.collisions++;
-    fail('小车碰撞到障碍物', true);
+    if (handleCarCollision()) tryReplan(true);
     return;
   }
   const dG = dist(car, goal);
@@ -1786,6 +1847,7 @@ function pushMetrics(){
 }
 function abortRun(msg){
   algo = null; mode = 'idle'; running = false;
+  replanning = false; dynamicStart = null;
   visReset(); dliteDirty = false; btnReplan.disabled = true;
   resetCarToStart();
   grid.buildFromWorld();
@@ -1835,10 +1897,17 @@ function setGoal(wx,wy){
   goal.x = wx; goal.y = wy;
   actionText('已设置终点');
 }
+function carClearRect(){
+  const s = Math.max(CAR_L, CAR_W) + 16; /* 车任意朝向的包围盒 + 余量 */
+  return { x: car.x - s/2, y: car.y - s/2, w: s, h: s };
+}
 function updateMovingObstacles(dt){
   if (!moveChk.checked) return;
   const sp = +moveSpeedRange.value;
   if (sp <= 0) return;
+  const carRect = carClearRect();
+  const goalRect = { x: goal.x - GOAL_CLEAR, y: goal.y - GOAL_CLEAR, w: GOAL_CLEAR*2, h: GOAL_CLEAR*2 };
+  const startRect = { x: start.x - START_R, y: start.y - START_R, w: START_R*2, h: START_R*2 };
   for (const o of world.obstacles){
     // 巡逻模式(手动路径点)优先
     if (o.patrol && o.patrol.length >= 2){
@@ -1848,7 +1917,7 @@ function updateMovingObstacles(dt){
       if (d < 2){
         o.patrolIdx = (o.patrolIdx + 1) % o.patrol.length;
       } else {
-        // 巡逻途中也避免与其他障碍重叠
+        // 巡逻途中也避免与其他障碍及小车重叠
         const nx = o.x + dx/d*sp*dt, ny = o.y + dy/d*sp*dt;
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
         let clear = true;
@@ -1856,6 +1925,9 @@ function updateMovingObstacles(dt){
           if (other === o) continue;
           if (aabbHit(nrect, other)){ clear = false; break; }
         }
+        if (clear && aabbHit(nrect, carRect)) clear = false;
+        if (clear && aabbHit(nrect, goalRect)) clear = false;
+        if (clear && aabbHit(nrect, startRect)) clear = false;
         if (clear && nx >= 0 && nx+o.w <= W && ny >= 0 && ny+o.h <= H){ o.x = nx; o.y = ny; }
       }
       continue;
@@ -1867,16 +1939,26 @@ function updateMovingObstacles(dt){
       if (o.x + o.w >= W) o.vel.vx = -Math.abs(o.vel.vx);
       if (o.y <= 0) o.vel.vy = Math.abs(o.vel.vy);
       if (o.y + o.h >= H) o.vel.vy = -Math.abs(o.vel.vy);
-      // 尝试 4 个候选方向,选第一个不与其他障碍重叠的
-      const cands = [
+      const carD = Math.hypot(car.x-(o.x+o.w/2), car.y-(o.y+o.h/2));
+      // 车接近时:闪避模式(加速 + 远离车方向优先)
+      const flee = carD < 150;
+      const stepSp = flee ? Math.min(420, sp*6) : sp;
+      let cands = [
         [o.vel.vx, o.vel.vy],
         [-o.vel.vx, o.vel.vy],
         [o.vel.vx, -o.vel.vy],
         [-o.vel.vx, -o.vel.vy]
       ];
+      if (flee){
+        cands.sort((a,b) => {
+          const da = Math.hypot((o.x+a[0]*stepSp*dt)-car.x, (o.y+a[1]*stepSp*dt)-car.y);
+          const db = Math.hypot((o.x+b[0]*stepSp*dt)-car.x, (o.y+b[1]*stepSp*dt)-car.y);
+          return db - da; /* 远离车(距离大)优先 */
+        });
+      }
       let moved = false;
       for (const [vx, vy] of cands){
-        const nx = o.x + vx*sp*dt, ny = o.y + vy*sp*dt;
+        const nx = o.x + vx*stepSp*dt, ny = o.y + vy*stepSp*dt;
         if (nx < 0 || nx+o.w > W || ny < 0 || ny+o.h > H) continue;
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
         let clear = true;
@@ -1884,6 +1966,9 @@ function updateMovingObstacles(dt){
           if (other === o) continue;
           if (aabbHit(nrect, other)){ clear = false; break; }
         }
+        if (clear && aabbHit(nrect, carRect)) clear = false;
+        if (clear && aabbHit(nrect, goalRect)) clear = false;
+        if (clear && aabbHit(nrect, startRect)) clear = false;
         if (clear){
           o.x = nx; o.y = ny;
           o.vel.vx = vx; o.vel.vy = vy;
@@ -2192,6 +2277,16 @@ function loop(t){
       handleEvents(algo.step());
     }
     if (algo.done) afterSearchDone();
+    else if (replanning && tracker && mode === 'searching'){
+      // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
+      car.v = +speedRange.value;
+      car.delta = trackerSteer();
+      carStep(car, dt*speedMult);
+      if (vehicleCollides(car, world.obstacles)){
+        if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
+        /* 撞移动 → 重规划已在搜索中,本帧不动 */
+      }
+    }
   } else if (mode === 'following'){
     acc += dt;
     while (acc >= 1/60){
@@ -2205,8 +2300,8 @@ function loop(t){
     metricsLive.timeMs = performance.now() - algo.t0;
     if (performance.now() - lastMetricsRender > 200){ lastMetricsRender = performance.now(); renderMetrics(); }
   }
-  // 相机跟随
-  if (mode === 'following'){ cam.x = car.x; cam.y = car.y; }
+  // 相机跟随(行驶/重规划巡航期间始终跟随车,避免视角跳变)
+  if (mode === 'following' || (replanning && mode === 'searching')){ cam.x = car.x; cam.y = car.y; }
   updateMovingObstacles(dt);
   render();
 }
@@ -2336,14 +2431,20 @@ manualChk.addEventListener('change', () => {
 });
 moveSpeedRange.addEventListener('input', () => { moveSpeedVal.textContent = moveSpeedRange.value; });
 btnRandomMove.addEventListener('click', () => {
-  if (!selectedObstacle){
-    actionText('请先用"障碍路径"工具点击选中障碍物');
-    return;
+  if (selectedObstacle){
+    const o = selectedObstacle;
+    o.patrol = null; o.patrolIdx = 0;
+    o.vel = makeRandomVel();
+    actionText('已设置该障碍随机移动');
+  } else {
+    let n = 0;
+    for (const o of world.obstacles){
+      o.patrol = null; o.patrolIdx = 0;
+      o.vel = makeRandomVel();
+      n++;
+    }
+    actionText('已设置全部 '+n+' 个障碍随机移动');
   }
-  const o = selectedObstacle;
-  o.patrol = null; o.patrolIdx = 0;
-  o.vel = makeRandomVel();
-  actionText('已设置随机移动(启用"移动障碍"后生效)');
 });
 btnClearPatrol.addEventListener('click', () => {
   if (selectedObstacle){
@@ -2352,7 +2453,13 @@ btnClearPatrol.addEventListener('click', () => {
     selectedObstacle.vel = null;
     actionText('已清除选中障碍的移动设置');
   } else {
-    actionText('请先选中障碍物');
+    let n = 0;
+    for (const o of world.obstacles){
+      o.patrol = null; o.patrolIdx = 0;
+      o.vel = null;
+      n++;
+    }
+    actionText('已清除全部 '+n+' 个障碍的移动设置');
   }
 });
 document.querySelectorAll('input[name=path]').forEach(r => r.addEventListener('change', () => { pathMode = document.querySelector('input[name=path]:checked').value; }));
