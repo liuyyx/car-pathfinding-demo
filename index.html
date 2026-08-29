@@ -46,7 +46,8 @@
     <label><input type="checkbox" id="moveChk">启用</label>
     <span class="grp-label">速度</span>
     <input type="range" id="moveSpeedRange" min="0" max="120" step="5" value="40"><span id="moveSpeedVal" style="min-width:28px">40</span>
-    <button id="btnClearPatrol">清除路径</button>
+    <button id="btnRandomMove">随机移动</button>
+    <button id="btnClearPatrol">清除移动</button>
   </span>
   <span class="grp"><span class="grp-label">覆盖率</span>
     <input type="range" id="coverRange" min="2" max="40" step="1" value="12"><span id="coverVal" style="min-width:130px">12%</span>
@@ -138,7 +139,7 @@ const btnRegen = $('btnRegen'), btnStart = $('btnStart'), btnPlay = $('btnPlay')
 const btnStep = $('btnStep'), speedSel = $('speedSel'), speedRange = $('speedRange'), speedVal = $('speedVal');
 const steerRange = $('steerRange'), steerVal = $('steerVal'), manualChk = $('manualChk');
 const btnReplan = $('btnReplan'), btnReset = $('btnReset'), btnResetStart = $('btnResetStart');
-const moveChk = $('moveChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnClearPatrol = $('btnClearPatrol');
+const moveChk = $('moveChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnRandomMove = $('btnRandomMove'), btnClearPatrol = $('btnClearPatrol');
 ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
 
 /* ============ 状态 ============ */
@@ -150,6 +151,8 @@ let mode = 'idle', algo = null, running = false, dliteDirty = false;
 let algId = 'astar', pathMode = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
 let selectedObstacle = null;
+let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
+function algoStart(){ return dynamicStart || start; }
 let lastT = performance.now(), acc = 0, lastMetricsRender = 0;
 let vw = 0, vh = 0;
 const vis = {
@@ -368,7 +371,7 @@ function createGridSearch(id){
     h(x,y){ return Math.hypot(x.x-y.x, x.y-y.y); },
     init(){
       grid.buildFromWorld();
-      this.startC = grid.cellAt(start.x, start.y);
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
       this.open = new MinHeap((x,y)=>x.f-y.f);
@@ -481,7 +484,7 @@ function createDlite(){
     },
     init(){
       grid.buildFromWorld();
-      this.startC = grid.cellAt(start.x, start.y);
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
       this.U = new MinHeap((x,y)=>keyCmp(x.key,y.key));
@@ -624,7 +627,8 @@ function createRRT(rrtstar){
     id: rrtstar ? 'rrtstar' : 'rrt', name, done:false, path:[], replanRun:false, failReason:'',
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
-      this.nodes = [ { x:start.x, y:start.y, parent:-1, cost:0 } ];
+      const s0 = algoStart();
+      this.nodes = [ { x:s0.x, y:s0.y, parent:-1, cost:0 } ];
       this.edges = [];
       this.iter = 0; this.t0 = performance.now();
       this.metrics.expanded = 0;
@@ -741,7 +745,8 @@ function createPRM(){
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
       this.phase = 'sample';
-      this.samples = [ {x:start.x,y:start.y}, {x:goal.x,y:goal.y} ];
+      const s0 = algoStart();
+      this.samples = [ {x:s0.x,y:s0.y}, {x:goal.x,y:goal.y} ];
       this.startIdx = 0; this.goalIdx = 1;
       this.edges = [];
       this.adj = [];
@@ -946,7 +951,8 @@ function createHybridAstar(){
       this.open = new MinHeap((x,y)=>x.f-y.f);
       this.gMap = new Map(); this.closed = new Set();
       this.pops = 0; this.t0 = performance.now();
-      this.s0 = this.mkState(start.x, start.y, start.theta, 0, null);
+      const s0 = algoStart();
+      this.s0 = this.mkState(s0.x, s0.y, s0.theta || 0, 0, null);
       this.gMap.set(this.s0.key, this.s0);
       this.open.push({ s:this.s0, f:this.h(this.s0) });
       visReset();
@@ -1055,7 +1061,7 @@ function createBFS(){
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
       grid.buildFromWorld();
-      this.startC = grid.cellAt(start.x, start.y);
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
       this.queue = [ this.startC ];
@@ -1147,7 +1153,7 @@ function createJPS(){
     },
     init(){
       grid.buildFromWorld();
-      this.startC = grid.cellAt(start.x, start.y);
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
       this.open = new MinHeap((x,y)=>x.f-y.f);
@@ -1227,7 +1233,8 @@ function createRRTConnect(){
     id:'rrtconnect', name:'RRT-Connect', done:false, path:[], replanRun:false, failReason:'',
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
-      this.treeA = [ {x:start.x, y:start.y, parent:-1} ];
+      const s0 = algoStart();
+      this.treeA = [ {x:s0.x, y:s0.y, parent:-1} ];
       this.treeB = [ {x:goal.x, y:goal.y, parent:-1} ];
       this.edges = [];
       this.iter = 0; this.turn = true;
@@ -1247,10 +1254,12 @@ function createRRTConnect(){
     },
     join(){
       const pts = [];
+      const tA = this.conn.aTree === 'A' ? this.treeA : this.treeB;
+      const tB = this.conn.aTree === 'A' ? this.treeB : this.treeA;
       let i = this.conn.aIdx;
-      while (i >= 0){ pts.unshift({x:this.treeA[i].x, y:this.treeA[i].y}); if (i===0) break; i = this.treeA[i].parent; }
+      while (i >= 0){ pts.unshift({x:tA[i].x, y:tA[i].y}); if (i===0) break; i = tA[i].parent; }
       let j = this.conn.bIdx;
-      while (j >= 0){ pts.push({x:this.treeB[j].x, y:this.treeB[j].y}); if (j===0) break; j = this.treeB[j].parent; }
+      while (j >= 0){ pts.push({x:tB[j].x, y:tB[j].y}); if (j===0) break; j = tB[j].parent; }
       return pts;
     },
     step(){
@@ -1292,7 +1301,7 @@ function createRRTConnect(){
             other.push({ x:px, y:py, parent });
             const bIdx = other.length - 1;
             this.edges.push({ a:parent, b:bIdx, tree:oName });
-            this.conn = { aIdx, bIdx };
+            this.conn = { aTree: tName, aIdx, bIdx };
             this.path = this.join();
             this.done = true;
             this.metrics.expanded = this.treeA.length + this.treeB.length;
@@ -1344,7 +1353,8 @@ function createVGraph(){
           if (!pointInInflated(c.x, c.y, CLEAR)) this.nodes.push(c);
         }
       }
-      this.startIdx = this.nodes.length; this.nodes.push({x:start.x, y:start.y});
+      const s0 = algoStart();
+      this.startIdx = this.nodes.length; this.nodes.push({x:s0.x, y:s0.y});
       this.goalIdx = this.nodes.length; this.nodes.push({x:goal.x, y:goal.y});
       this.adj = this.nodes.map(() => new Set());
       this.edges = [];
@@ -1438,7 +1448,7 @@ function createACO(){
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
       grid.buildFromWorld();
-      this.startC = grid.cellAt(start.x, start.y);
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
       this.ANT_N = 16; this.ANT_MAX = 320; this.MAX_ITER = 80;
@@ -1485,6 +1495,8 @@ function createACO(){
       else pick = cands[Math.floor(Math.random()*cands.length)].c;
       ant.x = pick.x; ant.y = pick.y;
       ant.path.push(pick);
+      // 移动沿途留微量信息素(探索痕迹,引导对方群蚂蚁)
+      this.tau[this.idx(pick)] += 0.02;
       if (isB){
         const k = ck(pick);
         if (!this.visitedB.has(k)){ this.visitedB.add(k); this.cellOwnerB.set(k, { ant, idx:ant.path.length-1 }); }
@@ -1628,6 +1640,7 @@ function visPathFromAlgo(){
 }
 function startSearch(){
   if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
+  dynamicStart = null;
   resetCarToStart();
   algo = createAlgorithm(algId);
   const ok = algo.init();
@@ -1658,7 +1671,7 @@ function afterSearchDone(){
   let pts = algo.path;
   if (pathMode === 'spline' && pts.length >= 2) pts = buildSpline(pts);
   tracker = { pts, idx:0 };
-  if (!algo.replanRun) resetCarToStart();
+  if (!algo.replanRun && !dynamicStart) resetCarToStart();
   else if (algo.path.length && vehicleCollides(car, world.obstacles)){
     car.x = algo.path[0].x; car.y = algo.path[0].y;
     if (algo.path.length > 1) car.theta = Math.atan2(algo.path[1].y-algo.path[0].y, algo.path[1].x-algo.path[0].x);
@@ -1669,6 +1682,65 @@ function afterSearchDone(){
   renderMetrics();
   actionText('小车沿路径行驶…');
 }
+let lastReplanT = 0;
+function segmentHitsObstacle(a, b){
+  const d = Math.hypot(b.x-a.x, b.y-a.y);
+  const n = Math.max(1, Math.ceil(d/8));
+  for (let k=0;k<=n;k++){
+    const t = k/n;
+    const px = a.x+(b.x-a.x)*t, py = a.y+(b.y-a.y)*t;
+    for (const o of world.obstacles){
+      if (px >= o.x && px <= o.x+o.w && py >= o.y && py <= o.y+o.h) return true;
+    }
+  }
+  return false;
+}
+function pathBlockedByObstacles(){
+  if (!tracker || tracker.pts.length < 2) return false;
+  for (let i = Math.max(0, tracker.idx); i < tracker.pts.length - 1; i++){
+    if (segmentHitsObstacle(tracker.pts[i], tracker.pts[i+1])) return true;
+  }
+  return false;
+}
+function frontBlocked(dist){
+  if (!tracker || tracker.pts.length < 2) return false;
+  for (let i = Math.max(0, tracker.idx); i < tracker.pts.length - 1; i++){
+    if (Math.hypot(tracker.pts[i].x - car.x, tracker.pts[i].y - car.y) > dist) break;
+    if (segmentHitsObstacle(tracker.pts[i], tracker.pts[i+1])) return true;
+  }
+  return false;
+}
+function tryReplan(){
+  const now = performance.now();
+  if (now - lastReplanT < 500) return;
+  if (!pathBlockedByObstacles()) return;
+  lastReplanT = now;
+  if (!algo) return;
+  if (algo.id === 'dlite' && algo.hasPlan){
+    // D* Lite:移动障碍改变网格 → 增量重规划
+    grid.buildFromWorld();
+    const after = blockedSet();
+    const changed = diffBlocked(algo.blockedBefore, after);
+    if (!changed.length) return;
+    algo.blockedBefore = after;
+    algo.replan(changed);
+    mode = 'searching'; running = true;
+    actionText('D* Lite:移动障碍触发增量重规划…');
+    return;
+  }
+  // 其他算法:从车当前位置重新搜索
+  dynamicStart = { x:car.x, y:car.y, theta:car.theta };
+  algo = createAlgorithm(algId);
+  const ok = algo.init();
+  if (ok === false){
+    dynamicStart = null;
+    actionText('重新规划失败:' + (algo.failReason || '未知原因'));
+    return;
+  }
+  metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
+  mode = 'searching'; running = true;
+  actionText(algo.name+':检测到移动障碍,重新规划路径…');
+}
 function followStep(dt){
   const dt2 = dt*speedMult;
   if (manualSteer){
@@ -1678,10 +1750,12 @@ function followStep(dt){
     const dG = dist(car, goal);
     let sp = +speedRange.value;
     if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
+    if (moveChk.checked && frontBlocked(150)) sp *= 0.25;
     car.v = sp;
     car.delta = trackerSteer();
   }
   carStep(car, dt2);
+  if (mode === 'following' && moveChk.checked) tryReplan();
   if (vehicleCollides(car, world.obstacles)){
     car.collided = true;
     metricsLive.collisions++;
@@ -1766,17 +1840,64 @@ function updateMovingObstacles(dt){
   const sp = +moveSpeedRange.value;
   if (sp <= 0) return;
   for (const o of world.obstacles){
-    if (!o.patrol || o.patrol.length < 2) continue;
-    const target = o.patrol[o.patrolIdx % o.patrol.length];
-    const dx = target.x - o.x, dy = target.y - o.y;
-    const d = Math.hypot(dx, dy);
-    if (d < 2){
-      o.patrolIdx = (o.patrolIdx + 1) % o.patrol.length;
-    } else {
-      o.x += dx/d*sp*dt;
-      o.y += dy/d*sp*dt;
+    // 巡逻模式(手动路径点)优先
+    if (o.patrol && o.patrol.length >= 2){
+      const target = o.patrol[o.patrolIdx % o.patrol.length];
+      const dx = target.x - o.x, dy = target.y - o.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 2){
+        o.patrolIdx = (o.patrolIdx + 1) % o.patrol.length;
+      } else {
+        // 巡逻途中也避免与其他障碍重叠
+        const nx = o.x + dx/d*sp*dt, ny = o.y + dy/d*sp*dt;
+        const nrect = { x:nx, y:ny, w:o.w, h:o.h };
+        let clear = true;
+        for (const other of world.obstacles){
+          if (other === o) continue;
+          if (aabbHit(nrect, other)){ clear = false; break; }
+        }
+        if (clear && nx >= 0 && nx+o.w <= W && ny >= 0 && ny+o.h <= H){ o.x = nx; o.y = ny; }
+      }
+      continue;
+    }
+    // 随机移动模式(有速度向量)
+    if (o.vel){
+      // 碰墙反弹
+      if (o.x <= 0) o.vel.vx = Math.abs(o.vel.vx);
+      if (o.x + o.w >= W) o.vel.vx = -Math.abs(o.vel.vx);
+      if (o.y <= 0) o.vel.vy = Math.abs(o.vel.vy);
+      if (o.y + o.h >= H) o.vel.vy = -Math.abs(o.vel.vy);
+      // 尝试 4 个候选方向,选第一个不与其他障碍重叠的
+      const cands = [
+        [o.vel.vx, o.vel.vy],
+        [-o.vel.vx, o.vel.vy],
+        [o.vel.vx, -o.vel.vy],
+        [-o.vel.vx, -o.vel.vy]
+      ];
+      let moved = false;
+      for (const [vx, vy] of cands){
+        const nx = o.x + vx*sp*dt, ny = o.y + vy*sp*dt;
+        if (nx < 0 || nx+o.w > W || ny < 0 || ny+o.h > H) continue;
+        const nrect = { x:nx, y:ny, w:o.w, h:o.h };
+        let clear = true;
+        for (const other of world.obstacles){
+          if (other === o) continue;
+          if (aabbHit(nrect, other)){ clear = false; break; }
+        }
+        if (clear){
+          o.x = nx; o.y = ny;
+          o.vel.vx = vx; o.vel.vy = vy;
+          moved = true;
+          break;
+        }
+      }
+      if (!moved){ o.vel.vx *= -1; o.vel.vy *= -1; }
     }
   }
+}
+function makeRandomVel(){
+  const a = Math.random()*Math.PI*2;
+  return { vx: Math.cos(a), vy: Math.sin(a) };
 }
 function doReplan(){
   if (!algo || algo.id !== 'dlite' || !dliteDirty) return;
@@ -2122,6 +2243,7 @@ canvas.addEventListener('mousedown', e => {
         if (!selectedObstacle.patrol) selectedObstacle.patrol = [];
         selectedObstacle.patrol.push({ x:w.x, y:w.y });
         selectedObstacle.patrolIdx = 0;
+        selectedObstacle.vel = null;
         actionText('已添加路径点 #'+selectedObstacle.patrol.length+'('+w.x.toFixed(0)+','+w.y.toFixed(0)+')');
       } else {
         actionText('请先点击一个障碍物进行选择');
@@ -2213,11 +2335,22 @@ manualChk.addEventListener('change', () => {
   steerRange.disabled = !manualSteer;
 });
 moveSpeedRange.addEventListener('input', () => { moveSpeedVal.textContent = moveSpeedRange.value; });
+btnRandomMove.addEventListener('click', () => {
+  if (!selectedObstacle){
+    actionText('请先用"障碍路径"工具点击选中障碍物');
+    return;
+  }
+  const o = selectedObstacle;
+  o.patrol = null; o.patrolIdx = 0;
+  o.vel = makeRandomVel();
+  actionText('已设置随机移动(启用"移动障碍"后生效)');
+});
 btnClearPatrol.addEventListener('click', () => {
   if (selectedObstacle){
     selectedObstacle.patrol = null;
     selectedObstacle.patrolIdx = 0;
-    actionText('已清除选中障碍的移动路径');
+    selectedObstacle.vel = null;
+    actionText('已清除选中障碍的移动设置');
   } else {
     actionText('请先选中障碍物');
   }
