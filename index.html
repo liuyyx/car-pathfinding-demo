@@ -1659,14 +1659,31 @@ function startSearch(){
     return;
   }
   window.__startRetry = 0;
+  __retryCount = 0;
   metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
   mode = 'searching'; running = true;
   renderMetrics();
   actionText(algo.name+':开始搜索…');
 }
+let __retryCount = 0;
+function autoRetrySearch(reason){
+  /* 仅移动障碍启用时:搜索未找到路径 → 等待障碍移开自动重试 */
+  if (!moveChk.checked) return false;
+  if (__retryCount >= 6) return false;
+  __retryCount++;
+  actionText(reason + ',移动障碍移动中,自动重试(' + __retryCount + '/6)…');
+  setTimeout(() => {
+    __retryCount--;
+    if (mode === 'failed' || mode === 'searching') startSearch();
+  }, 600);
+  return true;
+}
 function afterSearchDone(){
   if (algo.id === 'apf'){
-    if (algo.failReason){ fail(algo.failReason, false); return; }
+    if (algo.failReason){
+      if (autoRetrySearch(algo.failReason)) return;
+      fail(algo.failReason, false); return;
+    }
     metricsLive = { alg:algo.name, pathLen:algo.metrics.pathLen, expanded:algo.metrics.expanded, timeMs:algo.metrics.timeMs, collisions:0 };
     mode = 'arrived'; running = false;
     failMsg = '';
@@ -1675,6 +1692,7 @@ function afterSearchDone(){
     return;
   }
   if (!algo.path || algo.path.length === 0){
+    if (autoRetrySearch(algo.failReason || '未找到可行路径')) return;
     fail(algo.failReason || '未找到可行路径', false);
     return;
   }
