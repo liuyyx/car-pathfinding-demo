@@ -44,6 +44,7 @@
   </span>
   <span class="grp"><span class="grp-label">移动障碍:</span>
     <label><input type="checkbox" id="moveChk">启用</label>
+    <label><input type="checkbox" id="persistChk">持续寻路</label>
     <span class="grp-label">速度</span>
     <input type="range" id="moveSpeedRange" min="0" max="120" step="5" value="40"><span id="moveSpeedVal" style="min-width:28px">40</span>
     <button id="btnRandomMove">随机移动</button>
@@ -139,7 +140,7 @@ const btnRegen = $('btnRegen'), btnStart = $('btnStart'), btnPlay = $('btnPlay')
 const btnStep = $('btnStep'), speedSel = $('speedSel'), speedRange = $('speedRange'), speedVal = $('speedVal');
 const steerRange = $('steerRange'), steerVal = $('steerVal'), manualChk = $('manualChk');
 const btnReplan = $('btnReplan'), btnReset = $('btnReset'), btnResetStart = $('btnResetStart');
-const moveChk = $('moveChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnRandomMove = $('btnRandomMove'), btnClearPatrol = $('btnClearPatrol');
+const moveChk = $('moveChk'), persistChk = $('persistChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnRandomMove = $('btnRandomMove'), btnClearPatrol = $('btnClearPatrol');
 ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
 
 /* ============ 状态 ============ */
@@ -1795,6 +1796,7 @@ function afterSearchDone(){
   actionText('小车沿路径行驶…');
 }
 let lastReplanT = 0;
+let lastPersistT = 0;
 let lastGridCheckT = 0;
 let lastObstacleCells = new Set();
 function obstacleCells(){
@@ -1841,7 +1843,8 @@ function frontBlocked(dist){
 }
 function tryReplan(force){
   const now = performance.now();
-  if (now - lastReplanT < 500) return;
+  const cooldown = (force && persistChk.checked) ? 150 : 500;
+  if (now - lastReplanT < cooldown) return;
   if (!force && !frontBlocked(600)) return;
   lastReplanT = now;
   if (!algo) return;
@@ -1898,8 +1901,16 @@ function followStep(dt){
   }
   carStep(car, dt2);
   if (mode === 'following' && moveChk.checked){
-    tryReplan(false);
-    if (gridChangedByMoving()) tryReplan(true);
+    if (persistChk.checked){
+      // 持续寻路:每 0.2s 强制重规划,车始终沿最新路径
+      if (performance.now() - lastPersistT > 200){
+        lastPersistT = performance.now();
+        tryReplan(true);
+      }
+    } else {
+      tryReplan(false);
+      if (gridChangedByMoving()) tryReplan(true);
+    }
   }
   if (vehicleCollides(car, world.obstacles)){
     if (handleCarCollision()) tryReplan(true);
