@@ -1,0 +1,2249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小车寻路算法演示</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#e8eaee; }
+  body { font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; font-size:13px; color:#2b2f36; user-select:none; }
+  #toolbar { position:fixed; top:0; left:0; right:0; z-index:10; background:#fff; border-bottom:1px solid #d0d4da;
+    padding:6px 12px; display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; box-shadow:0 1px 3px rgba(0,0,0,.04); }
+  .grp { display:flex; align-items:center; gap:4px; white-space:nowrap; }
+  .grp-label { color:#6b7280; margin-right:2px; }
+  select, button { font:inherit; color:#2b2f36; background:#fff; border:1px solid #d0d4da; border-radius:6px; padding:3px 9px; cursor:pointer; }
+  button:hover:not(:disabled) { background:#f3f5f8; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.primary { background:#2f6fd8; border-color:#2f6fd8; color:#fff; }
+  button.primary:hover:not(:disabled) { background:#2559b0; }
+  input[type=range] { width:90px; accent-color:#2f6fd8; }
+  input[type=radio], input[type=checkbox] { accent-color:#2f6fd8; }
+  label { display:inline-flex; align-items:center; gap:2px; cursor:pointer; }
+  #actionText { position:fixed; left:12px; z-index:9; background:rgba(255,255,255,.94); border:1px solid #d0d4da;
+    border-radius:6px; padding:4px 10px; font-size:12px; color:#4b5563; max-width:72%; }
+  #metrics { position:fixed; right:12px; z-index:9; background:#fff; border:1px solid #d0d4da; border-radius:8px;
+    font-size:12px; min-width:300px; box-shadow:0 2px 6px rgba(0,0,0,.05); overflow:hidden; }
+  .m-head, .m-row { display:grid; grid-template-columns:92px 1.1fr 1fr 1fr 1fr; gap:4px; padding:4px 8px; align-items:center; }
+  .m-head { background:#f3f5f8; color:#6b7280; border-bottom:1px solid #e5e7eb; font-size:11px; }
+  .m-row { border-bottom:1px solid #f0f2f5; color:#374151; }
+  .m-row:last-child { border-bottom:none; }
+  .m-row.live { background:#eef4ff; font-weight:600; }
+  #cv { display:block; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <span class="grp"><span class="grp-label">算法</span><select id="algSel"></select></span>
+  <span class="grp"><span class="grp-label">工具:</span>
+    <label><input type="radio" name="tool" value="goal" checked>设置终点</label>
+    <label><input type="radio" name="tool" value="place">放置障碍</label>
+    <label><input type="radio" name="tool" value="delete">删除障碍</label>
+    <label><input type="radio" name="tool" value="patrol">障碍路径</label>
+  </span>
+  <span class="grp"><span class="grp-label">移动障碍:</span>
+    <label><input type="checkbox" id="moveChk">启用</label>
+    <span class="grp-label">速度</span>
+    <input type="range" id="moveSpeedRange" min="0" max="120" step="5" value="40"><span id="moveSpeedVal" style="min-width:28px">40</span>
+    <button id="btnClearPatrol">清除路径</button>
+  </span>
+  <span class="grp"><span class="grp-label">覆盖率</span>
+    <input type="range" id="coverRange" min="2" max="40" step="1" value="12"><span id="coverVal" style="min-width:130px">12%</span>
+    <button id="btnRegen">重新生成</button>
+  </span>
+  <span class="grp">
+    <button id="btnStart" class="primary">开始寻路</button>
+    <button id="btnPlay">⏵ 播放</button>
+    <button id="btnPause">⏸ 暂停</button>
+    <button id="btnStep">⏭ 单步</button>
+    <select id="speedSel">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select>
+  </span>
+  <span class="grp"><span class="grp-label">速度</span>
+    <input type="range" id="speedRange" min="0" max="300" step="5" value="120"><span id="speedVal" style="min-width:28px">120</span>
+  </span>
+  <span class="grp"><span class="grp-label">转向角</span>
+    <input type="range" id="steerRange" min="-40" max="40" step="1" value="0"><span id="steerVal" style="min-width:34px">0°</span>
+    <label><input type="checkbox" id="manualChk">手动转向</label>
+  </span>
+  <span class="grp"><span class="grp-label">路径:</span>
+    <label><input type="radio" name="path" value="line" checked>直线</label>
+    <label><input type="radio" name="path" value="spline">样条</label>
+  </span>
+  <span class="grp">
+    <button id="btnReplan" disabled>重规划</button>
+    <button id="btnReset">重置</button>
+    <button id="btnResetStart">重置起点</button>
+  </span>
+</div>
+
+<div id="actionText">就绪:点击空地设置终点,或选工具编辑障碍物</div>
+<div id="metrics"></div>
+<canvas id="cv"></canvas>
+
+<script>
+'use strict';
+window.__errs = [];
+window.onerror = function(m){ window.__errs.push(String(m)); };
+
+/* ============ 常量 ============ */
+const W = 2400, H = 1600, GRID = 24;
+const CAR_L = 56, CAR_W = 32, WHEELBASE = 36;
+const CLEAR = 38; /* 寻路占用网格的障碍物外扩(半车宽12收缩盒+切角余量) */
+const CLEAR_TREE = 52; /* RRT/PRM 树边线段外扩:额外补偿纯追踪在折角处的切角 */
+const GOAL_CLEAR = CLEAR_TREE + 4; /* 终点必须距障碍的距离(保证终点格自由且 RRT/PRM 可连接) */
+const START_R = 90, GOAL_PROT_R = 70;
+const LOOKAHEAD = 60, ARRIVE_DIST = 30;
+const RRT_STEP = 48, GOAL_R = 40, REWIRE_R = 120;
+const PRM_N = 400, PRM_K = 8;
+const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
+const SQRT2 = Math.SQRT2;
+const COLORS = {
+  bg:'#f7f8fa', outside:'#e8eaee', worldBorder:'#d0d4da', gridLine:'#eef0f4',
+  obstacle:'#c8ccd4', obstacleEdge:'#9aa0aa',
+  open:'#ffd166', closed:'#b8c4d8', current:'#ff8a5c',
+  edge:'#9fb4d8', tree:'#9fb4d8', rewire:'#a06cd5', replan:'#e5b8f5',
+  sample:'#7aa2f7', traj:'#8fd0c8',
+  path:'#2f9e6e', start:'#2f6fd8', goal:'#e11d48',
+  car:'#2f6fd8', carEdge:'#1f4f9e', wheel:'#16294d', force:'#ff8a5c', flash:'#e11d48'
+};
+const ALGORITHMS = [
+  { id:'astar',    name:'A*' },
+  { id:'dijkstra', name:'Dijkstra' },
+  { id:'dlite',    name:'D* Lite' },
+  { id:'rrt',      name:'RRT' },
+  { id:'rrtstar',  name:'RRT*' },
+  { id:'prm',      name:'PRM' },
+  { id:'apf',      name:'人工势场法' },
+  { id:'hybrid',   name:'混合 A*' },
+  { id:'bfs',      name:'BFS 广度优先' },
+  { id:'greedy',   name:'贪心最佳优先' },
+  { id:'jps',      name:'JPS 跳点' },
+  { id:'rrtconnect', name:'RRT-Connect' },
+  { id:'vgraph',   name:'可见性图' },
+  { id:'aco',      name:'蚁群算法' },
+];
+
+/* ============ DOM ============ */
+const $ = id => document.getElementById(id);
+const canvas = $('cv'), c2 = canvas.getContext('2d');
+const actionEl = $('actionText'), metricsEl = $('metrics'), toolbarEl = $('toolbar');
+const algSel = $('algSel'), coverRange = $('coverRange'), coverVal = $('coverVal');
+const btnRegen = $('btnRegen'), btnStart = $('btnStart'), btnPlay = $('btnPlay'), btnPause = $('btnPause');
+const btnStep = $('btnStep'), speedSel = $('speedSel'), speedRange = $('speedRange'), speedVal = $('speedVal');
+const steerRange = $('steerRange'), steerVal = $('steerVal'), manualChk = $('manualChk');
+const btnReplan = $('btnReplan'), btnReset = $('btnReset'), btnResetStart = $('btnResetStart');
+const moveChk = $('moveChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnClearPatrol = $('btnClearPatrol');
+ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
+
+/* ============ 状态 ============ */
+const world = { obstacles: [] };
+const start = { x: W/2, y: H/2, theta: 0 };
+const goal = { x: W-160, y: H-160 };
+const car = { x: start.x, y: start.y, theta: 0, v: 0, delta: 0, collided: false };
+let mode = 'idle', algo = null, running = false, dliteDirty = false;
+let algId = 'astar', pathMode = 'line', manualSteer = false, speedMult = 1;
+let failMsg = '', flashStart = 0, tracker = null;
+let selectedObstacle = null;
+let lastT = performance.now(), acc = 0, lastMetricsRender = 0;
+let vw = 0, vh = 0;
+const vis = {
+  openCells:new Map(), closedCells:new Map(), current:null,
+  edges:[], samples:[], replanCells:new Map(), trajs:[],
+  path:[], force:null, prmOpen:new Map(), prmClosed:new Map()
+};
+let metricsLive = { alg:'', pathLen:0, expanded:0, timeMs:0, collisions:0 };
+let metricsHistory = [];
+const mouse = { down:false, panning:false, mode:null, lastS:null, startW:null, curW:null, moved:false, button:0 };
+
+/* ============ 工具函数 ============ */
+const clamp = (v,a,b) => v < a ? a : (v > b ? b : v);
+function normAngle(a){ while(a > Math.PI) a -= 2*Math.PI; while(a < -Math.PI) a += 2*Math.PI; return a; }
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+function pathLen(pts){ let L=0; for(let i=1;i<pts.length;i++) L += Math.hypot(pts[i].x-pts[i-1].x, pts[i].y-pts[i-1].y); return L; }
+function aabbHit(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+function aabbMargin(a,b,m){ return a.x < b.x+b.w+m && a.x+a.w > b.x-m && a.y < b.y+b.h+m && a.y+a.h > b.y-m; }
+function circleRectHit(cx,cy,r,rc){ const px=clamp(cx,rc.x,rc.x+rc.w), py=clamp(cy,rc.y,rc.y+rc.h); const dx=cx-px, dy=cy-py; return dx*dx+dy*dy < r*r; }
+function inflated(r, cl){ cl = cl || CLEAR; return { x:r.x-cl, y:r.y-cl, w:r.w+2*cl, h:r.h+2*cl }; }
+function pointInInflated(px,py,cl){ for (const o of world.obstacles){ const i = inflated(o,cl); if (px>=i.x && px<=i.x+i.w && py>=i.y && py<=i.y+i.h) return true; } return false; }
+function pointFree(px,py){ return !pointInInflated(px,py,CLEAR_TREE) && px>=0 && py>=0 && px<=W && py<=H; }
+function rectClear(r){
+  for (const o of world.obstacles) if (aabbMargin(r,o,8)) return false;
+  if (circleRectHit(start.x,start.y,START_R,r)) return false;
+  if (circleRectHit(goal.x,goal.y,GOAL_PROT_R,r)) return false;
+  return true;
+}
+const ck = c => c.x + ',' + c.y;
+
+/* ============ 网格 ============ */
+const grid = {
+  cols:0, rows:0, free:null,
+  buildFromWorld(){
+    this.cols = Math.ceil(W/GRID); this.rows = Math.ceil(H/GRID);
+    this.free = new Uint8Array(this.cols*this.rows);
+    for (let y=0;y<this.rows;y++) for (let x=0;x<this.cols;x++){
+      const rc = inflated({ x:x*GRID, y:y*GRID, w:GRID, h:GRID });
+      let f = 1;
+      for (const o of world.obstacles){ if (aabbHit(rc,o)){ f=0; break; } }
+      this.free[y*this.cols+x] = f;
+    }
+  },
+  cellAt(wx,wy){ return { x:Math.floor(wx/GRID), y:Math.floor(wy/GRID) }; },
+  cellCenter(c){ return { x:(c.x+0.5)*GRID, y:(c.y+0.5)*GRID }; },
+  inBounds(c){ return c.x>=0 && c.x<this.cols && c.y>=0 && c.y<this.rows; },
+  isFree(c){ return this.inBounds(c) && this.free[c.y*this.cols+c.x] === 1; },
+  neighbors8(c){
+    const out = [];
+    for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
+      if (!dx && !dy) continue;
+      const n = { x:c.x+dx, y:c.y+dy };
+      if (!this.isFree(n)) continue;
+      if (dx && dy){
+        if (!this.isFree({ x:c.x+dx, y:c.y }) || !this.isFree({ x:c.x, y:c.y+dy })) continue;
+      }
+      out.push({ c:n, cost:(dx&&dy)?SQRT2:1 });
+    }
+    return out;
+  }
+};
+
+/* ============ 障碍物生成 ============ */
+function generateObstacles(targetCover){
+  world.obstacles = [];
+  selectedObstacle = null;
+  const totalArea = W*H, targetArea = targetCover*totalArea;
+  let area = 0;
+  for (let i=0;i<2000 && area<targetArea;i++){
+    const w = 40 + Math.random()*100, h = 40 + Math.random()*100;
+    const r = { x:Math.random()*(W-w), y:Math.random()*(H-h), w, h };
+    if (!rectClear(r)) continue;
+    world.obstacles.push(r);
+    area += w*h;
+  }
+  return area/totalArea;
+}
+function actualCover(){ let a=0; for (const o of world.obstacles) a += o.w*o.h; return a/(W*H); }
+function updateCoverDisplay(){
+  coverVal.textContent = coverTarget + '% (实际 ' + (actualCover()*100).toFixed(1) + '%)';
+}
+let coverTarget = 12;
+
+/* ============ 相机与画布 ============ */
+const cam = { x:start.x, y:start.y, scale:1 };
+function w2s(wx,wy){ return [ (wx-cam.x)*cam.scale + vw/2, (wy-cam.y)*cam.scale + vh/2 ]; }
+function s2w(sx,sy){ return { x:(sx-vw/2)/cam.scale + cam.x, y:(sy-vh/2)/cam.scale + cam.y }; }
+function resizeCanvas(){
+  const dpr = window.devicePixelRatio || 1;
+  vw = window.innerWidth; vh = window.innerHeight;
+  canvas.width = Math.round(vw*dpr); canvas.height = Math.round(vh*dpr);
+  canvas.style.width = vw+'px'; canvas.style.height = vh+'px';
+  c2.setTransform(dpr,0,0,dpr,0,0);
+}
+function layout(){
+  const tbH = toolbarEl.offsetHeight;
+  actionEl.style.top = (tbH + 8) + 'px';
+  metricsEl.style.top = (tbH + 8) + 'px';
+}
+
+/* ============ 车辆 ============ */
+function carStep(c,dt){
+  c.x += c.v*Math.cos(c.theta)*dt;
+  c.y += c.v*Math.sin(c.theta)*dt;
+  c.theta += (c.v/WHEELBASE)*Math.tan(c.delta)*dt;
+}
+function obbCorners(x,y,theta,l,w){
+  const c=Math.cos(theta), s=Math.sin(theta), hx=l/2, hy=w/2;
+  return [
+    [x+c*hx-s*hy, y+s*hx+c*hy],
+    [x+c*hx+s*hy, y+s*hx-c*hy],
+    [x-c*hx+s*hy, y-s*hx-c*hy],
+    [x-c*hx-s*hy, y-s*hx+c*hy],
+  ];
+}
+function obbRectHit(x,y,theta,r,l,w){
+  const corners = obbCorners(x,y,theta,l||CAR_L,w||CAR_W);
+  const axes = [ [1,0],[0,1],[Math.cos(theta),Math.sin(theta)],[-Math.sin(theta),Math.cos(theta)] ];
+  const rc = [ [r.x,r.y],[r.x+r.w,r.y],[r.x,r.y+r.h],[r.x+r.w,r.y+r.h] ];
+  for (const ax of axes){
+    let minA=Infinity,maxA=-Infinity,minB=Infinity,maxB=-Infinity;
+    for (const p of corners){ const v=p[0]*ax[0]+p[1]*ax[1]; minA=Math.min(minA,v); maxA=Math.max(maxA,v); }
+    for (const p of rc){ const v=p[0]*ax[0]+p[1]*ax[1]; minB=Math.min(minB,v); maxB=Math.max(maxB,v); }
+    if (maxA < minB || maxB < minA) return false;
+  }
+  return true;
+}
+// 碰撞盒每侧收缩 4px(保险杠余量),使通道需求与网格离散(GRID=24)精确匹配
+const HIT_L = CAR_L - 8, HIT_W = CAR_W - 8;
+function vehicleCollides(c,obs){
+  for (const o of obs) if (obbRectHit(c.x,c.y,c.theta,o,HIT_L,HIT_W)) return true;
+  return false;
+}
+function probeCollides(x,y,theta){
+  for (const o of world.obstacles){
+    // 混合 A* 轨迹为弧线段,折角处跟随会切角;碰撞检查加 12px 膨胀补偿
+    if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+  }
+  return false;
+}
+
+/* ============ 样条与跟踪 ============ */
+function buildSpline(pts){
+  const dense = [];
+  const n = pts.length;
+  let last = null;
+  const push = p => {
+    if (last && Math.hypot(p.x-last.x, p.y-last.y) < 8) return;
+    dense.push(p); last = p;
+  };
+  for (let i=0;i<n-1;i++){
+    const p0 = pts[Math.max(i-1,0)], p1 = pts[i], p2 = pts[i+1], p3 = pts[Math.min(i+2,n-1)];
+    for (let t=0;t<=1;t+=0.02){
+      const t2=t*t, t3=t2*t;
+      const x = 0.5*((2*p1.x)+(-p0.x+p2.x)*t+(2*p0.x-5*p1.x+4*p2.x-p3.x)*t2+(-p0.x+3*p1.x-3*p2.x+p3.x)*t3);
+      const y = 0.5*((2*p1.y)+(-p0.y+p2.y)*t+(2*p0.y-5*p1.y+4*p2.y-p3.y)*t2+(-p0.y+3*p1.y-3*p2.y+p3.y)*t3);
+      push({x,y});
+    }
+  }
+  const lastPt = pts[n-1];
+  if (!dense.length || Math.hypot(lastPt.x-dense[dense.length-1].x, lastPt.y-dense[dense.length-1].y) > 8) dense.push(lastPt);
+  return dense;
+}
+function trackerSteer(){
+  if (!tracker || tracker.pts.length < 2) return 0;
+  const pts = tracker.pts;
+  let target = pts[pts.length-1];
+  for (let i=tracker.idx;i<pts.length;i++){
+    if (Math.hypot(pts[i].x-car.x, pts[i].y-car.y) >= LOOKAHEAD){ target = pts[i]; tracker.idx = i; break; }
+  }
+  const alpha = normAngle(Math.atan2(target.y-car.y, target.x-car.x) - car.theta);
+  return Math.atan2(2*WHEELBASE*Math.sin(alpha), LOOKAHEAD);
+}
+
+/* ============ 二叉堆 ============ */
+class MinHeap {
+  constructor(cmp){ this.a=[]; this.cmp=cmp; }
+  get size(){ return this.a.length; }
+  push(x){
+    const a=this.a; a.push(x);
+    let i=a.length-1;
+    while(i>0){ const p=(i-1)>>1; if(this.cmp(a[i],a[p])<0){ const t=a[i]; a[i]=a[p]; a[p]=t; i=p; } else break; }
+  }
+  pop(){
+    const a=this.a;
+    if(a.length===1) return a.pop();
+    const top=a[0]; a[0]=a.pop();
+    let i=0;
+    for(;;){
+      const l=i*2+1, r=l+1; let m=i;
+      if(l<a.length && this.cmp(a[l],a[m])<0) m=l;
+      if(r<a.length && this.cmp(a[r],a[m])<0) m=r;
+      if(m===i) break;
+      const t=a[i]; a[i]=a[m]; a[m]=t; i=m;
+    }
+    return top;
+  }
+  peek(){ return this.a[0]; }
+}
+
+/* ============ 可视化状态 ============ */
+function visReset(){
+  vis.openCells.clear(); vis.closedCells.clear(); vis.current=null;
+  vis.edges.length=0; vis.samples.length=0; vis.replanCells.clear(); vis.trajs.length=0;
+  vis.path.length=0; vis.force=null; vis.prmOpen.clear(); vis.prmClosed.clear();
+}
+
+/* ============ 网格搜索框架(A星/Dijkstra/贪心最佳优先) ============ */
+function createGridSearch(id){
+  const isGreedy = id === 'greedy';
+  const useH = id !== 'dijkstra';
+  const name = isGreedy ? '贪心最佳优先' : (useH ? 'A*' : 'Dijkstra');
+  const a = {
+    id, name, done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(x,y){ return Math.hypot(x.x-y.x, x.y-y.y); },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(start.x, start.y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.open = new MinHeap((x,y)=>x.f-y.f);
+      this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+      this.t0 = performance.now(); this.steps = 0;
+      const s = this.startC, k = ck(s);
+      this.g.set(k,0);
+      this.open.push({ c:s, g:0, f:isGreedy ? this.h(s,this.goalC) : (useH?this.h(s,this.goalC):0) });
+      visReset();
+      vis.openCells.set(k, s);
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.open.size === 0){
+        this.done = true; this.failReason='无可行路径(open 已空)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:name+':搜索结束,未找到路径' });
+        return events;
+      }
+      const node = this.open.pop();
+      const c = node.c, k = ck(c);
+      if (this.closed.has(k)) return events;
+      this.closed.add(k);
+      vis.closedCells.set(k,c); vis.openCells.delete(k);
+      this.steps++;
+      vis.current = grid.cellCenter(c);
+      this.metrics.expanded = this.closed.size;
+      this.metrics.timeMs = performance.now()-this.t0;
+      if (k === ck(this.goalC)){
+        this.path = this.backtrace(c);
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:name+':到达终点,路径长度 '+this.metrics.pathLen.toFixed(0)+'px,扩展 '+this.closed.size+' 节点' });
+        return events;
+      }
+      const cc = grid.cellCenter(c);
+      events.push({ type:'info', text:name+':扩展 ('+cc.x.toFixed(0)+','+cc.y.toFixed(0)+'),f='+node.f.toFixed(1) });
+      for (const nb of grid.neighbors8(c)){
+        const nk = ck(nb.c);
+        const ng = node.g + nb.cost;
+        if (this.closed.has(nk)) continue;
+        const old = this.g.get(nk);
+        if (old === undefined || ng < old){
+          this.g.set(nk, ng);
+          this.parent.set(nk, c);
+          this.open.push({ c:nb.c, g:ng, f:isGreedy ? this.h(nb.c,this.goalC) : (ng+(useH?this.h(nb.c,this.goalC):0)) });
+          if (!vis.openCells.has(nk)){
+            vis.openCells.set(nk, nb.c);
+            const pc = grid.cellCenter(c), nc2 = grid.cellCenter(nb.c);
+            vis.edges.push({ x1:pc.x, y1:pc.y, x2:nc2.x, y2:nc2.y });
+          }
+        }
+      }
+      return events;
+    },
+    backtrace(c){
+      const pts = [];
+      let cur = c, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ D* Lite ============ */
+function keyCmp(a,b){ return (a[0]-b[0]) || (a[1]-b[1]); }
+function blockedSet(){
+  const s = new Set();
+  for (let y=0;y<grid.rows;y++) for (let x=0;x<grid.cols;x++) if (!grid.free[y*grid.cols+x]) s.add(x+','+y);
+  return s;
+}
+function diffBlocked(before, after){
+  const ch = [];
+  for (const k of before) if (!after.has(k)) ch.push(k);
+  for (const k of after) if (!before.has(k)) ch.push(k);
+  return ch.map(k => { const p = k.split(','); return { x:+p[0], y:+p[1] }; });
+}
+function nearestFreeCell(wx, wy){
+  const c0 = grid.cellAt(wx, wy);
+  if (grid.isFree(c0)) return c0;
+  for (let r = 1; r < 300; r++){
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++){
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+      const c = { x:c0.x+dx, y:c0.y+dy };
+      if (grid.isFree(c)) return c;
+    }
+  }
+  return c0;
+}
+function createDlite(){
+  const a = {
+    id:'dlite', name:'D* Lite', done:false, path:[], hasPlan:false, replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c){ return Math.hypot(c.x-this.startC.x, c.y-this.startC.y); },
+    cost(u,v){
+      if (!grid.isFree(u) || !grid.isFree(v)) return Infinity;
+      return (u.x!==v.x && u.y!==v.y) ? SQRT2 : 1;
+    },
+    calcKey(c){
+      const k = ck(c);
+      const g = this.g.get(k) ?? Infinity, rhs = this.rhs.get(k) ?? Infinity;
+      const m = Math.min(g, rhs);
+      return [m + this.h(c), m];
+    },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(start.x, start.y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.U = new MinHeap((x,y)=>keyCmp(x.key,y.key));
+      this.inU = new Map();
+      this.g = new Map(); this.rhs = new Map();
+      this.pops = 0; this.t0 = performance.now();
+      this.done = false; this.replanRun = false; this.hasPlan = false;
+      const gk = ck(this.goalC);
+      this.rhs.set(gk, 0);
+      this.insert(this.goalC, this.calcKey(this.goalC));
+      this.blockedBefore = blockedSet();
+      visReset();
+      vis.current = grid.cellCenter(this.goalC);
+      return true;
+    },
+    insert(c, key){
+      const e = { c, key, dead:false };
+      this.U.push(e);
+      this.inU.set(ck(c), e);
+    },
+    updateVertex(u){
+      const k = ck(u);
+      if (k !== ck(this.goalC)){
+        let m = Infinity;
+        for (const nb of grid.neighbors8(u)){
+          const nbc = nb.c;
+          const gv = this.g.get(ck(nbc));
+          if (gv !== undefined) m = Math.min(m, gv + this.cost(nbc, u));
+        }
+        this.rhs.set(k, m);
+      }
+      const old = this.inU.get(k);
+      if (old){ old.dead = true; this.inU.delete(k); vis.openCells.delete(k); }
+      const g = this.g.get(k) ?? Infinity, rhs = this.rhs.get(k) ?? Infinity;
+      if (g !== rhs){ this.insert(u, this.calcKey(u)); vis.openCells.set(k, u); vis.closedCells.delete(k); }
+      else if (isFinite(g)){ vis.closedCells.set(k, u); }
+    },
+    topValid(){
+      while (this.U.size){
+        const e = this.U.peek();
+        if (e.dead){ this.U.pop(); continue; }
+        return e;
+      }
+      return null;
+    },
+    step(){
+      const events = [];
+      if (this.done) return events;
+      const top = this.topValid();
+      const kStart = this.calcKey(this.startC);
+      if (!top || (keyCmp(top.key, kStart) >= 0 && (this.rhs.get(ck(this.startC)) ?? Infinity) === (this.g.get(ck(this.startC)) ?? Infinity))){
+        this.finish();
+        events.push({ type:'info', text: this.replanRun ? 'D* Lite:增量重规划完成' : 'D* Lite:初始规划完成' });
+        return events;
+      }
+      const u = this.U.pop();
+      if (u.dead) return events;
+      this.inU.delete(ck(u.c));
+      const kold = u.key, kcur = this.calcKey(u.c);
+      if (keyCmp(kold, kcur) < 0){ this.insert(u.c, kcur); return events; }
+      this.pops++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const uk = ck(u.c);
+      const g = this.g.get(uk) ?? Infinity, rhs = this.rhs.get(uk) ?? Infinity;
+      vis.current = grid.cellCenter(u.c);
+      events.push({ type:'expand', c:u.c });
+      if (g > rhs){
+        this.g.set(uk, rhs);
+        if (isFinite(rhs)){ vis.closedCells.set(uk, u.c); vis.openCells.delete(uk); }
+        else vis.closedCells.delete(uk);
+        for (const s of grid.neighbors8(u.c)) this.updateVertex(s.c);
+      } else {
+        this.g.set(uk, Infinity);
+        vis.closedCells.delete(uk);
+        for (const s of grid.neighbors8(u.c)) this.updateVertex(s.c);
+        this.updateVertex(u.c);
+      }
+      return events;
+    },
+    finish(){
+      this.done = true; this.hasPlan = true;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const gs = this.g.get(ck(this.startC));
+      if (gs === undefined || !isFinite(gs)){ this.failReason='无可行路径(起点不可达)'; return; }
+      const path = [ this.startC ];
+      let c = this.startC, guard = 0;
+      while (ck(c) !== ck(this.goalC) && guard++ < 20000){
+        let best = null, bc = Infinity;
+        for (const nb of grid.neighbors8(c)){
+          const nbc = nb.c;
+          const gv = this.g.get(ck(nbc));
+          if (gv === undefined) continue;
+          const v = gv + this.cost(c, nbc);
+          if (v < bc){ bc = v; best = nbc; }
+        }
+        if (!best){ this.failReason='无可行路径(路径不连通)'; this.path=[]; return; }
+        path.push(best); c = best;
+      }
+      if (ck(c) !== ck(this.goalC)){ this.failReason='无可行路径(路径不连通)'; this.path=[]; return; }
+      this.path = path.map(cc => ({ x:(cc.x+0.5)*GRID, y:(cc.y+0.5)*GRID }));
+      this.metrics.pathLen = pathLen(this.path);
+    },
+    replan(changed){
+      this.replanRun = true;
+      this.done = false;
+      this.startC = nearestFreeCell(car.x, car.y);
+      this.pops = 0; this.t0 = performance.now(); this.path = [];
+      this.metrics.pathLen = 0; this.metrics.expanded = 0; this.metrics.timeMs = 0;
+      vis.replanCells.clear();
+      for (const cc of changed) vis.replanCells.set(ck(cc), cc);
+      for (const cc of changed){
+        for (const nb of grid.neighbors8(cc)) this.updateVertex(nb.c);
+        this.updateVertex(cc);
+      }
+      // 起点变化(车移动)后所有 key 的启发式变化,整体重算 key
+      const items = [];
+      for (const e of this.inU.values()){ e.dead = true; items.push(e.c); }
+      this.inU.clear(); this.U = new MinHeap((x,y)=>keyCmp(x.key,y.key));
+      for (const cc of items) this.insert(cc, this.calcKey(cc));
+    }
+  };
+  return a;
+}
+
+/* ============ RRT / RRT* ============ */
+function segmentFree(a,b){
+  const d = Math.hypot(b.x-a.x, b.y-a.y);
+  const n = Math.max(1, Math.ceil(d/6));
+  for (let i=0;i<=n;i++){
+    const t = i/n;
+    if (!pointFree(a.x+(b.x-a.x)*t, a.y+(b.y-a.y)*t)) return false;
+  }
+  return true;
+}
+function createRRT(rrtstar){
+  const name = rrtstar ? 'RRT*' : 'RRT';
+  const a = {
+    id: rrtstar ? 'rrtstar' : 'rrt', name, done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.nodes = [ { x:start.x, y:start.y, parent:-1, cost:0 } ];
+      this.edges = [];
+      this.iter = 0; this.t0 = performance.now();
+      this.metrics.expanded = 0;
+      visReset();
+      return true;
+    },
+    backtrace(){
+      const pts = [];
+      let i = this.nodes.length - 1, guard = 0;
+      while (i >= 0 && guard++ < 50000){
+        const n = this.nodes[i];
+        pts.unshift({ x:n.x, y:n.y });
+        if (i === 0) break;
+        i = n.parent;
+      }
+      return pts;
+    },
+    connectGoal(nn, events){
+      // 尝试把终点直接连入树(终点距障碍 >= CLEAR+12 > CLEAR_TREE,段可自由通过)
+      const dg = Math.hypot(goal.x - nn.x, goal.y - nn.y);
+      if (dg >= RRT_STEP) return false;
+      if (!segmentFree(nn, { x:goal.x, y:goal.y })) return false;
+      this.nodes.push({ x:goal.x, y:goal.y, parent:this.nodes.length-1, cost:nn.cost + dg });
+      this.edges.push({ a:this.nodes.length-2, b:this.nodes.length-1, kind:'new' });
+      events.push({ type:'tree', from:nn, to:{x:goal.x,y:goal.y}, kind:'new' });
+      this.path = this.backtrace();
+      this.metrics.pathLen = pathLen(this.path);
+      this.metrics.expanded = this.nodes.length;
+      this.metrics.timeMs = performance.now()-this.t0;
+      events.push({ type:'info', text:name+':到达终点,'+this.nodes.length+' 个节点' });
+      return true;
+    },
+    step(){
+      const events = [];
+      this.iter++;
+      this.metrics.timeMs = performance.now()-this.t0;
+      let sx, sy;
+      if (this.iter % 10 === 0){ sx = goal.x; sy = goal.y; }
+      else { sx = Math.random()*W; sy = Math.random()*H; }
+      let ni = 0, bd = Infinity;
+      for (let i=0;i<this.nodes.length;i++){
+        const dx = this.nodes[i].x - sx, dy = this.nodes[i].y - sy;
+        const d = dx*dx + dy*dy;
+        if (d < bd){ bd = d; ni = i; }
+      }
+      const near = this.nodes[ni];
+      const d = Math.sqrt(bd);
+      let px, py;
+      if (d <= RRT_STEP){ px = sx; py = sy; }
+      else { px = near.x + (sx-near.x)/d*RRT_STEP; py = near.y + (sy-near.y)/d*RRT_STEP; }
+      const nn = { x:px, y:py, parent:-1, cost:0 };
+      if (segmentFree(near, nn)){
+        if (rrtstar){
+          let best = ni, bestCost = near.cost + d;
+          for (let i=0;i<this.nodes.length;i++){
+            const dd = Math.hypot(px-this.nodes[i].x, py-this.nodes[i].y);
+            if (dd <= REWIRE_R && segmentFree(this.nodes[i], nn)){
+              const c = this.nodes[i].cost + dd;
+              if (c < bestCost){ bestCost = c; best = i; }
+            }
+          }
+          nn.parent = best; nn.cost = bestCost;
+          this.nodes.push(nn);
+          const idx = this.nodes.length - 1;
+          this.edges.push({ a:best, b:idx, kind:'new' });
+          events.push({ type:'tree', from:this.nodes[best], to:nn, kind:'new' });
+          let rewired = 0;
+          for (let i=0;i<idx;i++){
+            if (i === best) continue;
+            const dd = Math.hypot(px-this.nodes[i].x, py-this.nodes[i].y);
+            if (dd <= REWIRE_R && segmentFree(nn, this.nodes[i]) && nn.cost + dd < this.nodes[i].cost){
+              const oldP = this.nodes[i].parent;
+              for (let e=this.edges.length-1;e>=0;e--){
+                const ed = this.edges[e];
+                if (ed.b === i && ed.a === oldP){ this.edges.splice(e,1); break; }
+              }
+              this.edges.push({ a:idx, b:i, kind:'rewire' });
+              this.nodes[i].parent = idx; this.nodes[i].cost = nn.cost + dd;
+              events.push({ type:'tree', from:nn, to:this.nodes[i], kind:'rewire' });
+              rewired++;
+            }
+          }
+          this.metrics.expanded = this.nodes.length;
+          if (this.connectGoal(nn, events)){
+            this.done = true;
+            this.metrics.timeMs = performance.now()-this.t0;
+          } else {
+            events.push({ type:'info', text:name+':新增节点 #'+this.nodes.length+(rewired?',重连 '+rewired+' 个近邻':'') });
+          }
+        } else {
+          nn.parent = ni; nn.cost = near.cost + d;
+          this.nodes.push(nn);
+          this.edges.push({ a:ni, b:this.nodes.length-1, kind:'new' });
+          events.push({ type:'tree', from:near, to:nn, kind:'new' });
+          this.metrics.expanded = this.nodes.length;
+          if (this.connectGoal(nn, events)){
+            this.done = true;
+            this.metrics.timeMs = performance.now()-this.t0;
+          } else {
+            events.push({ type:'info', text:name+':新增节点 #'+this.nodes.length });
+          }
+        }
+      }
+      return events;
+    }
+  };
+  return a;
+}
+
+/* ============ PRM ============ */
+function createPRM(){
+  const a = {
+    id:'prm', name:'PRM', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.phase = 'sample';
+      this.samples = [ {x:start.x,y:start.y}, {x:goal.x,y:goal.y} ];
+      this.startIdx = 0; this.goalIdx = 1;
+      this.edges = [];
+      this.adj = [];
+      this.pops = 0; this.t0 = performance.now();
+      visReset();
+      vis.samples = this.samples;
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.phase === 'sample'){
+        for (let k=0;k<10 && this.samples.length < PRM_N+2;k++){
+          const p = { x:Math.random()*W, y:Math.random()*H };
+          if (pointFree(p.x,p.y)){ this.samples.push(p); events.push({ type:'sample', p }); }
+        }
+        this.metrics.expanded = this.samples.length;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.samples.length >= PRM_N+2){
+          this.phase = 'graph'; this.si = 0;
+          this.adj = this.samples.map(() => new Set());
+          events.push({ type:'info', text:'PRM:采样完成,构建路图…' });
+        } else {
+          events.push({ type:'info', text:'PRM:采样 '+this.samples.length+'/'+PRM_N });
+        }
+      } else if (this.phase === 'graph'){
+        const si = this.si;
+        const p = this.samples[si];
+        const kLimit = (si === this.startIdx || si === this.goalIdx) ? 24 : PRM_K;
+        const order = [];
+        for (let j=0;j<this.samples.length;j++){
+          if (j === si) continue;
+          order.push([j, Math.hypot(p.x-this.samples[j].x, p.y-this.samples[j].y)]);
+        }
+        order.sort((x,y)=>x[1]-y[1]);
+        let added = 0;
+        for (let t=0;t<order.length && added<kLimit;t++){
+          const j = order[t][0];
+          if (this.adj[si].has(j)) continue;
+          if (segmentFree(p, this.samples[j])){
+            this.adj[si].add(j); this.adj[j].add(si);
+            this.edges.push([si,j]);
+            events.push({ type:'edge', a:si, b:j });
+            added++;
+          }
+        }
+        this.si++;
+        this.metrics.expanded = this.samples.length;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.si >= this.samples.length){
+          this.phase = 'search';
+          this.open = new MinHeap((x,y)=>x.f-y.f);
+          this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+          const s0 = this.startIdx;
+          this.g.set(s0, 0);
+          this.open.push({ i:s0, g:0, f:Math.hypot(this.samples[s0].x-this.samples[this.goalIdx].x, this.samples[s0].y-this.samples[this.goalIdx].y) });
+          events.push({ type:'info', text:'PRM:路图完成,图上搜索…' });
+        } else {
+          events.push({ type:'info', text:'PRM:连接节点 '+si+'/'+this.samples.length });
+        }
+      } else {
+        if (this.open.size === 0){
+          this.done = true; this.failReason='图上无可行路径';
+          this.metrics.timeMs = performance.now()-this.t0;
+          events.push({ type:'info', text:'PRM:图上无路径' });
+          return events;
+        }
+        const node = this.open.pop();
+        const i = node.i;
+        if (this.closed.has(i)) return events;
+        this.closed.add(i); this.pops++;
+        this.metrics.expanded = this.pops;
+        this.metrics.timeMs = performance.now()-this.t0;
+        vis.prmClosed.set(i, this.samples[i]);
+        vis.prmOpen.delete(i);
+        vis.current = this.samples[i];
+        if (i === this.goalIdx){
+          this.path = this.backtrace(i);
+          this.done = true;
+          this.metrics.pathLen = pathLen(this.path);
+          events.push({ type:'info', text:'PRM:找到路径,扩展 '+this.pops+' 节点' });
+          return events;
+        }
+        for (const j of this.adj[i]){
+          if (this.closed.has(j)) continue;
+          const ng = node.g + Math.hypot(this.samples[i].x-this.samples[j].x, this.samples[i].y-this.samples[j].y);
+          const old = this.g.get(j);
+          if (old === undefined || ng < old){
+            this.g.set(j, ng); this.parent.set(j, i);
+            this.open.push({ i:j, g:ng, f:ng+Math.hypot(this.samples[j].x-this.samples[this.goalIdx].x, this.samples[j].y-this.samples[this.goalIdx].y) });
+            vis.prmOpen.set(j, this.samples[j]);
+          }
+        }
+      }
+      return events;
+    },
+    backtrace(i){
+      const pts = [];
+      let cur = i, guard = 0;
+      while (cur !== undefined && guard++ < 50000){
+        pts.unshift(this.samples[cur]);
+        if (cur === this.startIdx) break;
+        cur = this.parent.get(cur);
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ 人工势场法 ============ */
+function createAPF(){
+  const a = {
+    id:'apf', name:'人工势场法', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.steps = 0; this.trav = 0; this.stall = 0;
+      this.lastX = car.x; this.lastY = car.y;
+      this.t0 = performance.now();
+      visReset();
+      return true;
+    },
+    step(){
+      const events = [];
+      const p = car;
+      this.steps++;
+      this.metrics.expanded = this.steps;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const dG = Math.hypot(goal.x-p.x, goal.y-p.y);
+      if (dG < 30){
+        this.done = true;
+        this.metrics.pathLen = this.trav;
+        events.push({ type:'info', text:'人工势场法:已到达终点(步数 '+this.steps+')' });
+        return events;
+      }
+      let fx = 0, fy = 0;
+      fx += K_ATT*(goal.x-p.x)/Math.max(dG,1e-6);
+      fy += K_ATT*(goal.y-p.y)/Math.max(dG,1e-6);
+      for (const o of world.obstacles){
+        const qx = clamp(p.x, o.x, o.x+o.w), qy = clamp(p.y, o.y, o.y+o.h);
+        const dx = p.x-qx, dy = p.y-qy;
+        const d = Math.hypot(dx,dy);
+        if (d < D0){
+          let m, ux, uy;
+          if (d > 1e-6){
+            m = K_REP*(1/d - 1/D0)/(d*d);
+            ux = dx/d; uy = dy/d;
+          } else {
+            // 车在障碍内部:朝最近边界推离(自行车模型防止被弹穿)
+            m = 80;
+            const left = p.x-o.x, right = (o.x+o.w)-p.x, top = p.y-o.y, bottom = (o.y+o.h)-p.y;
+            const mn = Math.min(left, right, top, bottom);
+            if (mn === left){ ux = -1; uy = 0; }
+            else if (mn === right){ ux = 1; uy = 0; }
+            else if (mn === top){ ux = 0; uy = -1; }
+            else { ux = 0; uy = 1; }
+          }
+          fx += m*ux; fy += m*uy;
+        }
+      }
+      const fRaw = Math.hypot(fx, fy);
+      const oldX = p.x, oldY = p.y;
+      if (fRaw > 1e-6){
+        const nx = fx/fRaw, ny = fy/fRaw;
+        const spd = speedRange.value * Math.min(1, fRaw/0.15);
+        p.x += nx*spd*0.05; p.y += ny*spd*0.05;
+        p.v = spd;
+        const tgt = Math.atan2(ny, nx);
+        p.delta = clamp(normAngle(tgt - p.theta), -0.7, 0.7);
+        p.theta += normAngle(tgt - p.theta) * 0.25;
+      } else {
+        p.v = 0; // 合力为零 → 停在势场极小点
+        p.delta = 0;
+      }
+      this.trav += Math.hypot(p.x-oldX, p.y-oldY);
+      const moved = Math.hypot(p.x-this.lastX, p.y-this.lastY);
+      this.lastX = p.x; this.lastY = p.y;
+      if (moved < 2){
+        this.stall++;
+        if (this.stall >= STALL_N){
+          this.done = true; this.failReason='陷入局部极小(势场法局限)';
+          this.metrics.pathLen = this.trav;
+          events.push({ type:'info', text:'势场法停滞:陷入局部极小' });
+          return events;
+        }
+      } else this.stall = 0;
+      vis.force = { x:p.x, y:p.y, fx:(fRaw>1e-6 ? fx/fRaw*90 : 0), fy:(fRaw>1e-6 ? fy/fRaw*90 : 0) };
+      events.push({ type:'force' });
+      events.push({ type:'info', text:'人工势场法:合力 '+fRaw.toFixed(3)+',步 '+this.steps });
+      return events;
+    }
+  };
+  return a;
+}
+
+/* ============ 混合 A* ============ */
+function createHybridAstar(){
+  const a = {
+    id:'hybrid', name:'混合 A*', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      grid.buildFromWorld();
+      this.open = new MinHeap((x,y)=>x.f-y.f);
+      this.gMap = new Map(); this.closed = new Set();
+      this.pops = 0; this.t0 = performance.now();
+      this.s0 = this.mkState(start.x, start.y, start.theta, 0, null);
+      this.gMap.set(this.s0.key, this.s0);
+      this.open.push({ s:this.s0, f:this.h(this.s0) });
+      visReset();
+      return true;
+    },
+    h(s){ return Math.hypot(goal.x-s.x, goal.y-s.y); },
+    mkState(x,y,theta,g,parent){
+      const gi = ((Math.round(theta/(Math.PI*2/16))%16)+16)%16;
+      const key = Math.floor(x/GRID)+','+Math.floor(y/GRID)+','+gi;
+      return { x, y, theta, g, parent, key, traj:null };
+    },
+    simulate(s, dd){
+      let x=s.x, y=s.y, th=s.theta;
+      const poses = [];
+      for (let k=0;k<5;k++){
+        x += 120*Math.cos(th)*0.1;
+        y += 120*Math.sin(th)*0.1;
+        th += (120/WHEELBASE)*Math.tan(dd)*0.1;
+        if (probeCollides(x,y,th)) return null;
+        poses.push({ x, y, theta:th });
+      }
+      return poses;
+    },
+    trajLen(s, poses){
+      let L = Math.hypot(poses[0].x-s.x, poses[0].y-s.y);
+      for (let i=1;i<poses.length;i++) L += Math.hypot(poses[i].x-poses[i-1].x, poses[i].y-poses[i-1].y);
+      return L;
+    },
+    backtrace(s){
+      const pts = [];
+      let cur = s, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift({ x:cur.x, y:cur.y });
+        cur = cur.parent;
+      }
+      return pts;
+    },
+    step(){
+      const events = [];
+      if (this.open.size === 0){
+        this.done = true; this.failReason='无可行路径(状态空间已穷尽)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'混合 A*:未找到路径' });
+        return events;
+      }
+      const e = this.open.pop();
+      const s = e.s;
+      if (this.closed.has(s.key)) return events;
+      this.closed.add(s.key); this.pops++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const ck2 = Math.floor(s.x/GRID)+','+Math.floor(s.y/GRID);
+      vis.closedCells.set(ck2, { x:Math.floor(s.x/GRID), y:Math.floor(s.y/GRID) });
+      vis.current = { x:s.x, y:s.y };
+      if (Math.hypot(s.x-goal.x, s.y-goal.y) < 40){
+        this.path = this.backtrace(s);
+        this.path.push({ x:goal.x, y:goal.y });
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'混合 A*:找到路径,扩展 '+this.pops+' 状态' });
+        return events;
+      }
+      for (const dd of [-Math.PI/4, 0, Math.PI/4]){
+        const poses = this.simulate(s, dd);
+        if (!poses) continue;
+        const end = poses[poses.length-1];
+        const cost = s.g + this.trajLen(s, poses);
+        let reached = false;
+        for (const pp of poses){
+          if (Math.hypot(pp.x-goal.x, pp.y-goal.y) < 40){ reached = true; break; }
+        }
+        if (reached){
+          const ns = this.mkState(goal.x, goal.y, end.theta, cost, s);
+          ns.traj = poses;
+          this.gMap.set(ns.key, ns);
+          this.path = this.backtrace(ns);
+          this.done = true;
+          this.metrics.pathLen = pathLen(this.path);
+          events.push({ type:'info', text:'混合 A*:找到路径,扩展 '+this.pops+' 状态' });
+          return events;
+        }
+        const ns = this.mkState(end.x, end.y, end.theta, cost, s);
+        if (this.closed.has(ns.key)) continue;
+        const old = this.gMap.get(ns.key);
+        if (!old || cost < old.g){
+          ns.traj = poses;
+          this.gMap.set(ns.key, ns);
+          this.open.push({ s:ns, f:cost+this.h(ns) });
+          vis.trajs.push(poses);
+          const ck3 = Math.floor(end.x/GRID)+','+Math.floor(end.y/GRID);
+          vis.openCells.set(ck3, { x:Math.floor(end.x/GRID), y:Math.floor(end.y/GRID) });
+          events.push({ type:'traj' });
+        }
+      }
+      events.push({ type:'info', text:'混合 A*:扩展状态 '+this.pops+',open '+this.open.size });
+      return events;
+    }
+  };
+  return a;
+}
+
+/* ============ BFS 广度优先 ============ */
+function createBFS(){
+  const a = {
+    id:'bfs', name:'BFS 广度优先', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(start.x, start.y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.queue = [ this.startC ];
+      this.visited = new Set([ ck(this.startC) ]);
+      this.parent = new Map();
+      this.pops = 0; this.t0 = performance.now();
+      visReset();
+      vis.openCells.set(ck(this.startC), this.startC);
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.queue.length === 0){
+        this.done = true; this.failReason='无可行路径(队列已空)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'BFS:搜索结束,未找到路径' });
+        return events;
+      }
+      const c = this.queue.shift();
+      const k = ck(c);
+      this.pops++;
+      vis.closedCells.set(k,c); vis.openCells.delete(k);
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      vis.current = grid.cellCenter(c);
+      if (k === ck(this.goalC)){
+        this.path = this.backtrace(c);
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'BFS:到达终点,扩展 '+this.pops+' 节点' });
+        return events;
+      }
+      const cc = grid.cellCenter(c);
+      const depth = Math.max(Math.abs(c.x-this.startC.x), Math.abs(c.y-this.startC.y));
+      events.push({ type:'info', text:'BFS:层 '+depth+' 扩展 ('+cc.x.toFixed(0)+','+cc.y.toFixed(0)+')' });
+      for (const nb of grid.neighbors8(c)){
+        const nk = ck(nb.c);
+        if (this.visited.has(nk)) continue;
+        this.visited.add(nk);
+        this.parent.set(nk, c);
+        this.queue.push(nb.c);
+        vis.openCells.set(nk, nb.c);
+      }
+      return events;
+    },
+    backtrace(c){
+      const pts = [];
+      let cur = c, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ JPS 跳点搜索 ============ */
+function createJPS(){
+  const a = {
+    id:'jps', name:'JPS 跳点', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y); },
+    blocked(c){ return !grid.isFree(c); },
+    forced(n, dx, dy){
+      if (dx && dy){
+        if ((this.blocked({x:n.x-dx, y:n.y}) && grid.isFree({x:n.x-dx, y:n.y+dy})) ||
+            (this.blocked({x:n.x, y:n.y-dy}) && grid.isFree({x:n.x+dx, y:n.y-dy}))) return true;
+      } else if (dx){
+        if ((this.blocked({x:n.x, y:n.y+1}) && grid.isFree({x:n.x+dx, y:n.y+1})) ||
+            (this.blocked({x:n.x, y:n.y-1}) && grid.isFree({x:n.x+dx, y:n.y-1}))) return true;
+      } else if (dy){
+        if ((this.blocked({x:n.x+1, y:n.y}) && grid.isFree({x:n.x+1, y:n.y+dy})) ||
+            (this.blocked({x:n.x-1, y:n.y}) && grid.isFree({x:n.x-1, y:n.y+dy}))) return true;
+      }
+      return false;
+    },
+    jump(pos, dx, dy){
+      const n = { x:pos.x+dx, y:pos.y+dy };
+      if (this.blocked(n)) return null;
+      if (ck(n) === ck(this.goalC)) return n;
+      if (this.forced(n, dx, dy)) return n;
+      if (dx && dy){
+        if (this.jump(n, dx, 0) || this.jump(n, 0, dy)) return n;
+      }
+      return this.jump(n, dx, dy);
+    },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(start.x, start.y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.open = new MinHeap((x,y)=>x.f-y.f);
+      this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+      this.pops = 0; this.t0 = performance.now();
+      const s = this.startC, k = ck(s);
+      this.g.set(k, 0);
+      this.open.push({ c:s, g:0, f:this.h(s) });
+      visReset();
+      vis.openCells.set(k, s);
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.open.size === 0){
+        this.done = true; this.failReason='无可行路径(open 已空)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'JPS:搜索结束,未找到路径' });
+        return events;
+      }
+      const node = this.open.pop();
+      const c = node.c, k = ck(c);
+      if (this.closed.has(k)) return events;
+      this.closed.add(k);
+      this.pops++;
+      vis.closedCells.set(k,c); vis.openCells.delete(k);
+      this.metrics.expanded = this.closed.size;
+      this.metrics.timeMs = performance.now()-this.t0;
+      vis.current = grid.cellCenter(c);
+      if (k === ck(this.goalC)){
+        this.path = this.backtrace(c);
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'JPS:到达终点,仅扩展 '+this.closed.size+' 个跳点' });
+        return events;
+      }
+      const cc = grid.cellCenter(c);
+      events.push({ type:'info', text:'JPS:从跳点 ('+cc.x.toFixed(0)+','+cc.y.toFixed(0)+') 跳跃扩展…' });
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
+        if (!dx && !dy) continue;
+        const jp = this.jump(c, dx, dy);
+        if (!jp) continue;
+        const jk = ck(jp);
+        if (this.closed.has(jk)) continue;
+        const ng = node.g + Math.hypot(jp.x-c.x, jp.y-c.y);
+        const old = this.g.get(jk);
+        if (old === undefined || ng < old){
+          this.g.set(jk, ng);
+          this.parent.set(jk, c);
+          this.open.push({ c:jp, g:ng, f:ng+this.h(jp) });
+          if (!vis.openCells.has(jk)){
+            vis.openCells.set(jk, jp);
+            const pc = grid.cellCenter(c), jpc = grid.cellCenter(jp);
+            vis.edges.push({ x1:pc.x, y1:pc.y, x2:jpc.x, y2:jpc.y });
+          }
+        }
+      }
+      return events;
+    },
+    backtrace(c){
+      const pts = [];
+      let cur = c, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ RRT-Connect 双向 ============ */
+function createRRTConnect(){
+  const a = {
+    id:'rrtconnect', name:'RRT-Connect', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.treeA = [ {x:start.x, y:start.y, parent:-1} ];
+      this.treeB = [ {x:goal.x, y:goal.y, parent:-1} ];
+      this.edges = [];
+      this.iter = 0; this.turn = true;
+      this.t0 = performance.now();
+      this.metrics.expanded = 0;
+      visReset();
+      return true;
+    },
+    nearest(tree, x, y){
+      let ni = 0, bd = Infinity;
+      for (let i=0;i<tree.length;i++){
+        const dx = tree[i].x-x, dy = tree[i].y-y;
+        const d = dx*dx+dy*dy;
+        if (d < bd){ bd = d; ni = i; }
+      }
+      return { idx:ni, dist:Math.sqrt(bd), node:tree[ni] };
+    },
+    join(){
+      const pts = [];
+      let i = this.conn.aIdx;
+      while (i >= 0){ pts.unshift({x:this.treeA[i].x, y:this.treeA[i].y}); if (i===0) break; i = this.treeA[i].parent; }
+      let j = this.conn.bIdx;
+      while (j >= 0){ pts.push({x:this.treeB[j].x, y:this.treeB[j].y}); if (j===0) break; j = this.treeB[j].parent; }
+      return pts;
+    },
+    step(){
+      const events = [];
+      this.iter++;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const isA = this.turn;
+      const tree = isA ? this.treeA : this.treeB;
+      const other = isA ? this.treeB : this.treeA;
+      const tName = isA ? 'A' : 'B';
+      const oName = isA ? 'B' : 'A';
+      let sx, sy;
+      if (this.iter % 10 === 0){ const tg = isA ? goal : start; sx = tg.x; sy = tg.y; }
+      else { sx = Math.random()*W; sy = Math.random()*H; }
+      const near = this.nearest(tree, sx, sy);
+      let px, py;
+      if (near.dist <= RRT_STEP){ px = sx; py = sy; }
+      else { px = near.node.x + (sx-near.node.x)/near.dist*RRT_STEP; py = near.node.y + (sy-near.node.y)/near.dist*RRT_STEP; }
+      if (!segmentFree(near.node, {x:px, y:py})){
+        this.turn = !this.turn;
+        return events;
+      }
+      tree.push({ x:px, y:py, parent:near.idx });
+      const aIdx = tree.length - 1;
+      this.edges.push({ a:near.idx, b:aIdx, tree:tName });
+      events.push({ type:'tree', from:near.node, to:{x:px,y:py}, tree:tName });
+      // 另一棵树朝新节点延伸(多步逼近)
+      let ex = 0, ey = 0, parent = -1;
+      {
+        const n2 = this.nearest(other, px, py);
+        ex = n2.node.x; ey = n2.node.y; parent = n2.idx;
+      }
+      let connected = false;
+      for (let g = 0; g < 30 && !connected; g++){
+        const dx = px-ex, dy = py-ey;
+        const dd = Math.hypot(dx, dy);
+        if (dd < 30){
+          if (segmentFree({x:ex,y:ey}, {x:px,y:py})){
+            other.push({ x:px, y:py, parent });
+            const bIdx = other.length - 1;
+            this.edges.push({ a:parent, b:bIdx, tree:oName });
+            this.conn = { aIdx, bIdx };
+            this.path = this.join();
+            this.done = true;
+            this.metrics.expanded = this.treeA.length + this.treeB.length;
+            this.metrics.pathLen = pathLen(this.path);
+            events.push({ type:'info', text:'RRT-Connect:两树相遇,路径 '+this.metrics.pathLen.toFixed(0)+'px,节点 '+(this.treeA.length+this.treeB.length) });
+          }
+          connected = true;
+          break;
+        }
+        const nx2 = ex + dx/dd*RRT_STEP, ny2 = ey + dy/dd*RRT_STEP;
+        if (!segmentFree({x:ex,y:ey}, {x:nx2,y:ny2})) break;
+        other.push({ x:nx2, y:ny2, parent });
+        this.edges.push({ a:parent, b:other.length-1, tree:oName });
+        ex = nx2; ey = ny2; parent = other.length - 1;
+      }
+      this.metrics.expanded = this.treeA.length + this.treeB.length;
+      if (!this.done) events.push({ type:'info', text:'RRT-Connect:树'+tName+' 生长,节点 '+(this.treeA.length+this.treeB.length) });
+      this.turn = !this.turn;
+      return events;
+    }
+  };
+  return a;
+}
+
+/* ============ 可见性图 ============ */
+function segmentFreeInfl(a,b){
+  const d = Math.hypot(b.x-a.x, b.y-a.y);
+  const n = Math.max(1, Math.ceil(d/6));
+  for (let i=0;i<=n;i++){
+    const t = i/n;
+    if (pointInInflated(a.x+(b.x-a.x)*t, a.y+(b.y-a.y)*t, CLEAR)) return false;
+  }
+  return true;
+}
+function createVGraph(){
+  const a = {
+    id:'vgraph', name:'可见性图', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.nodes = [];
+      for (const o of world.obstacles){
+        const i = inflated(o);
+        const cand = [
+          {x:i.x-2, y:i.y-2}, {x:i.x+i.w+2, y:i.y-2},
+          {x:i.x-2, y:i.y+i.h+2}, {x:i.x+i.w+2, y:i.y+i.h+2}
+        ];
+        // 顶点外移 2px 避开膨胀区边界;若落入其他障碍膨胀区(重叠)则丢弃
+        for (const c of cand){
+          if (!pointInInflated(c.x, c.y, CLEAR)) this.nodes.push(c);
+        }
+      }
+      this.startIdx = this.nodes.length; this.nodes.push({x:start.x, y:start.y});
+      this.goalIdx = this.nodes.length; this.nodes.push({x:goal.x, y:goal.y});
+      this.adj = this.nodes.map(() => new Set());
+      this.edges = [];
+      this.samples = this.nodes;
+      this.phase = 'build'; this.si = 0; this.pops = 0;
+      this.t0 = performance.now();
+      visReset();
+      vis.samples = this.nodes;
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.phase === 'build'){
+        const si = this.si;
+        const p = this.nodes[si];
+        for (let j=0;j<this.nodes.length;j++){
+          if (j === si || this.adj[si].has(j)) continue;
+          if (segmentFreeInfl(p, this.nodes[j])){
+            this.adj[si].add(j); this.adj[j].add(si);
+            this.edges.push([si, j]);
+          }
+        }
+        this.si++;
+        this.metrics.expanded = this.si;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.si >= this.nodes.length){
+          this.phase = 'search';
+          this.open = new MinHeap((x,y)=>x.f-y.f);
+          this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+          const s0 = this.startIdx;
+          this.g.set(s0, 0);
+          this.open.push({ i:s0, g:0, f:dist(this.nodes[s0], this.nodes[this.goalIdx]) });
+          events.push({ type:'info', text:'可见性图:图构建完成('+this.nodes.length+' 顶点),图上搜索…' });
+        } else {
+          events.push({ type:'info', text:'可见性图:连接顶点 '+si+'/'+this.nodes.length });
+        }
+        return events;
+      }
+      if (this.open.size === 0){
+        this.done = true; this.failReason='图上无可行路径';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'可见性图:图上无路径' });
+        return events;
+      }
+      const node = this.open.pop();
+      const i = node.i;
+      if (this.closed.has(i)) return events;
+      this.closed.add(i); this.pops++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      vis.prmClosed.set(i, this.nodes[i]);
+      vis.prmOpen.delete(i);
+      vis.current = this.nodes[i];
+      if (i === this.goalIdx){
+        this.path = this.backtrace(i);
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'可见性图:找到最短路径 '+this.metrics.pathLen.toFixed(0)+'px,扩展 '+this.pops+' 顶点' });
+        return events;
+      }
+      for (const j of this.adj[i]){
+        if (this.closed.has(j)) continue;
+        const ng = node.g + dist(this.nodes[i], this.nodes[j]);
+        const old = this.g.get(j);
+        if (old === undefined || ng < old){
+          this.g.set(j, ng); this.parent.set(j, i);
+          this.open.push({ i:j, g:ng, f:ng+dist(this.nodes[j], this.nodes[this.goalIdx]) });
+          vis.prmOpen.set(j, this.nodes[j]);
+        }
+      }
+      return events;
+    },
+    backtrace(i){
+      const pts = [];
+      let cur = i, guard = 0;
+      while (cur !== undefined && guard++ < 50000){
+        pts.unshift(this.nodes[cur]);
+        if (cur === this.startIdx) break;
+        cur = this.parent.get(cur);
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ 蚁群算法 ACO(双向:两群蚂蚁相向而行,相遇合并) ============ */
+function createACO(){
+  const a = {
+    id:'aco', name:'蚁群算法', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(start.x, start.y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.ANT_N = 16; this.ANT_MAX = 320; this.MAX_ITER = 80;
+      this.ALPHA = 1; this.BETA = 3; this.RHO = 0.12; this.Q = 100;
+      // A 群(朝终点)偏贪心推进;B 群(朝起点)偏随机扩散覆盖,两群相遇合并
+      this.GREEDY_A = 0.7; this.GREEDY_B = 0.3;
+      this.retriesLeft = 3; // 失败自动重置信息素重试
+      this.tau = new Float32Array(grid.cols*grid.rows);
+      for (let i=0;i<this.tau.length;i++) this.tau[i] = 0.1;
+      this.iter = 0; this.bestLen = Infinity; this.bestPath = [];
+      this.t0 = performance.now();
+      this.spawnAnts();
+      visReset();
+      this.pheromone = this.tau;
+      vis.current = grid.cellCenter(this.startC);
+      return true;
+    },
+    idx(c){ return c.y*grid.cols + c.x; },
+    spawnAnts(){
+      this.antsA = []; this.antsB = [];
+      this.visitedB = new Set(); this.cellOwnerB = new Map();
+      for (let i=0;i<this.ANT_N;i++){
+        this.antsA.push({ x:this.startC.x, y:this.startC.y, path:[this.startC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_A });
+        this.antsB.push({ x:this.goalC.x, y:this.goalC.y, path:[this.goalC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_B });
+      }
+      this.visitedB.add(ck(this.goalC));
+      this.cellOwnerB.set(ck(this.goalC), { ant:this.antsB[0], idx:0 });
+      this.reachedPaths = [];
+    },
+    moveAnt(ant, target, isB){
+      const nb = grid.neighbors8({ x:ant.x, y:ant.y });
+      const cands = [];
+      for (const n of nb){
+        const k = this.idx(n.c);
+        const w = Math.pow(this.tau[k], this.ALPHA) * Math.pow(1/(1+Math.hypot(n.c.x-target.x, n.c.y-target.y)), this.BETA);
+        cands.push({ c:n.c, w });
+      }
+      if (cands.length === 0){ ant.done = true; return; }
+      let best = cands[0].c, bestW = cands[0].w;
+      for (const cd of cands) if (cd.w > bestW){ bestW = cd.w; best = cd.c; }
+      const gRate = ant.greedy !== undefined ? ant.greedy : this.GREEDY;
+      let pick;
+      if (Math.random() < gRate) pick = best;
+      else pick = cands[Math.floor(Math.random()*cands.length)].c;
+      ant.x = pick.x; ant.y = pick.y;
+      ant.path.push(pick);
+      if (isB){
+        const k = ck(pick);
+        if (!this.visitedB.has(k)){ this.visitedB.add(k); this.cellOwnerB.set(k, { ant, idx:ant.path.length-1 }); }
+      }
+    },
+    recordPath(path){
+      const L = pathLen(path.map(grid.cellCenter));
+      if (L < this.bestLen){
+        this.bestLen = L;
+        this.bestPath = path.slice();
+        vis.path.length = 0;
+        for (const p of path) vis.path.push(grid.cellCenter(p));
+      }
+    },
+    step(){
+      const events = [];
+      let anyActive = false;
+      // A 群(朝终点)
+      for (const ant of this.antsA){
+        if (ant.done) continue;
+        anyActive = true;
+        for (let mv=0; mv<2; mv++){
+          ant.steps++;
+          if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
+          this.moveAnt(ant, this.goalC, false);
+          if (ant.done) break;
+          const dg = Math.max(Math.abs(ant.x-this.goalC.x), Math.abs(ant.y-this.goalC.y));
+          if (dg <= 2){
+            if (dg > 0){ ant.path.push(this.goalC); }
+            ant.done = true;
+            this.reachedPaths.push(ant.path.slice());
+            this.recordPath(ant.path);
+            break;
+          }
+          // 相遇检测
+          const k = ck(ant);
+          if (this.cellOwnerB.has(k)){
+            const owner = this.cellOwnerB.get(k);
+            // B 路径为 goal→start 方向,取相遇点之前的段(相遇→goal)反向拼接
+            const tail = owner.ant.path.slice(0, owner.idx+1).reverse();
+            const merged = ant.path.concat(tail);
+            ant.done = true;
+            this.reachedPaths.push(merged);
+            this.recordPath(merged);
+            break;
+          }
+        }
+      }
+      // B 群(朝起点)
+      for (const ant of this.antsB){
+        if (ant.done) continue;
+        anyActive = true;
+        for (let mv=0; mv<2; mv++){
+          ant.steps++;
+          if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
+          this.moveAnt(ant, this.startC, true);
+          if (ant.done) break;
+          const ds = Math.max(Math.abs(ant.x-this.startC.x), Math.abs(ant.y-this.startC.y));
+          if (ds <= 2){
+            if (ds > 0){ ant.path.push(this.startC); }
+            ant.done = true;
+            const rev = ant.path.slice().reverse();
+            this.reachedPaths.push(rev);
+            this.recordPath(rev);
+            break;
+          }
+        }
+      }
+      if (!anyActive){
+        for (let i=0;i<this.tau.length;i++) this.tau[i] *= (1-this.RHO);
+        for (const p of this.reachedPaths){
+          const L = pathLen(p.map(grid.cellCenter));
+          if (L <= 0) continue;
+          const dTau = this.Q / L;
+          for (let i=0;i<p.length-1;i++) this.tau[this.idx(p[i])] += dTau;
+        }
+        this.iter++;
+        this.metrics.expanded = this.iter * this.ANT_N * 2;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.iter >= this.MAX_ITER){
+          if (!this.bestPath.length && this.retriesLeft > 0){
+            // 自动重试:重置信息素与迭代计数
+            this.retriesLeft--;
+            for (let i=0;i<this.tau.length;i++) this.tau[i] = 0.1;
+            this.iter = 0; this.bestLen = Infinity; this.bestPath = [];
+            this.spawnAnts();
+            events.push({ type:'info', text:'蚁群:未收敛,重置信息素重试(剩余 '+this.retriesLeft+' 次)' });
+            return events;
+          }
+          this.done = true;
+          if (this.bestPath.length){
+            this.path = this.bestPath.map(grid.cellCenter);
+            this.metrics.pathLen = pathLen(this.path);
+            events.push({ type:'info', text:'蚁群:收敛,最优路径 '+this.metrics.pathLen.toFixed(0)+'px(第 '+this.iter+' 轮)' });
+          } else {
+            this.failReason = '蚁群未找到可行路径';
+            events.push({ type:'info', text:'蚁群:'+this.failReason });
+          }
+          return events;
+        }
+        this.spawnAnts();
+        events.push({ type:'info', text:'蚁群:第 '+this.iter+'/'+this.MAX_ITER+' 轮,到达 '+this.reachedPaths.length+' 条,当前最优 '+(this.bestLen===Infinity?'-':this.bestLen.toFixed(0))+'px' });
+        return events;
+      }
+      return events;
+    }
+  };
+  return a;
+}
+
+/* ============ 算法工厂 ============ */
+function createAlgorithm(id){
+  switch (id){
+    case 'astar': return createGridSearch('astar');
+    case 'dijkstra': return createGridSearch('dijkstra');
+    case 'greedy': return createGridSearch('greedy');
+    case 'dlite': return createDlite();
+    case 'rrt': return createRRT(false);
+    case 'rrtstar': return createRRT(true);
+    case 'prm': return createPRM();
+    case 'apf': return createAPF();
+    case 'hybrid': return createHybridAstar();
+    case 'bfs': return createBFS();
+    case 'jps': return createJPS();
+    case 'rrtconnect': return createRRTConnect();
+    case 'vgraph': return createVGraph();
+    case 'aco': return createACO();
+  }
+  return createGridSearch('astar');
+}
+
+/* ============ 状态机 ============ */
+function actionText(msg){ actionEl.textContent = msg; }
+function resetCarToStart(){
+  car.x = start.x; car.y = start.y; car.theta = start.theta;
+  car.v = 0; car.delta = 0; car.collided = false;
+}
+function visPathFromAlgo(){
+  vis.path.length = 0;
+  if (algo && algo.path) for (const p of algo.path) vis.path.push(p);
+}
+function startSearch(){
+  if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
+  resetCarToStart();
+  algo = createAlgorithm(algId);
+  const ok = algo.init();
+  if (ok === false){
+    actionText(algo.failReason || '无法开始搜索');
+    return;
+  }
+  metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
+  mode = 'searching'; running = true;
+  renderMetrics();
+  actionText(algo.name+':开始搜索…');
+}
+function afterSearchDone(){
+  if (algo.id === 'apf'){
+    if (algo.failReason){ fail(algo.failReason, false); return; }
+    metricsLive = { alg:algo.name, pathLen:algo.metrics.pathLen, expanded:algo.metrics.expanded, timeMs:algo.metrics.timeMs, collisions:0 };
+    mode = 'arrived'; running = false;
+    failMsg = '';
+    pushMetrics();
+    actionText('人工势场法:已到达终点');
+    return;
+  }
+  if (!algo.path || algo.path.length === 0){
+    fail(algo.failReason || '未找到可行路径', false);
+    return;
+  }
+  visPathFromAlgo();
+  let pts = algo.path;
+  if (pathMode === 'spline' && pts.length >= 2) pts = buildSpline(pts);
+  tracker = { pts, idx:0 };
+  if (!algo.replanRun) resetCarToStart();
+  else if (algo.path.length && vehicleCollides(car, world.obstacles)){
+    car.x = algo.path[0].x; car.y = algo.path[0].y;
+    if (algo.path.length > 1) car.theta = Math.atan2(algo.path[1].y-algo.path[0].y, algo.path[1].x-algo.path[0].x);
+  }
+  car.v = 0; car.delta = 0; car.collided = false;
+  metricsLive = { alg:algo.name, pathLen:algo.metrics.pathLen, expanded:algo.metrics.expanded, timeMs:algo.metrics.timeMs, collisions:0 };
+  mode = 'following'; running = true;
+  renderMetrics();
+  actionText('小车沿路径行驶…');
+}
+function followStep(dt){
+  const dt2 = dt*speedMult;
+  if (manualSteer){
+    car.v = +speedRange.value;
+    car.delta = +steerRange.value*Math.PI/180;
+  } else {
+    const dG = dist(car, goal);
+    let sp = +speedRange.value;
+    if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
+    car.v = sp;
+    car.delta = trackerSteer();
+  }
+  carStep(car, dt2);
+  if (vehicleCollides(car, world.obstacles)){
+    car.collided = true;
+    metricsLive.collisions++;
+    fail('小车碰撞到障碍物', true);
+    return;
+  }
+  const dG = dist(car, goal);
+  const pathDone = tracker && tracker.idx >= tracker.pts.length-1 && Math.hypot(car.x-tracker.pts[tracker.pts.length-1].x, car.y-tracker.pts[tracker.pts.length-1].y) < 25;
+  if (dG < ARRIVE_DIST || pathDone){
+    mode = 'arrived'; running = false;
+    failMsg = '';
+    pushMetrics();
+    actionText('已到达终点');
+  }
+}
+function fail(msg, fromFollowing){
+  mode = 'failed'; running = false; failMsg = msg; flashStart = performance.now();
+  actionText(msg);
+  if (fromFollowing) pushMetrics();
+  else renderMetrics();
+}
+function pushMetrics(){
+  if (!metricsLive.alg) return;
+  metricsHistory.unshift(Object.assign({}, metricsLive));
+  if (metricsHistory.length > 8) metricsHistory.pop();
+  metricsLive = { alg:'', pathLen:0, expanded:0, timeMs:0, collisions:0 };
+  renderMetrics();
+}
+function abortRun(msg){
+  algo = null; mode = 'idle'; running = false;
+  visReset(); dliteDirty = false; btnReplan.disabled = true;
+  resetCarToStart();
+  grid.buildFromWorld();
+  if (msg) actionText(msg); else actionText('就绪:点击空地设置终点,或选工具编辑障碍物');
+  renderMetrics();
+}
+function handleEvents(ev){
+  if (!ev) return;
+  for (const e of ev) if (e.type === 'info') actionText(e.text);
+}
+
+/* ============ 世界编辑 ============ */
+function afterWorldChange(){
+  grid.buildFromWorld();
+  updateCoverDisplay();
+  if (algo && algo.id === 'dlite' && algo.hasPlan && (mode === 'idle' || mode === 'arrived' || mode === 'following')){
+    dliteDirty = true; btnReplan.disabled = false;
+    actionText('地图已变化,可点击"重规划"增量修复路径');
+  } else if (mode === 'searching'){
+    abortRun('地图已变化,已中断当前运行');
+  } else if (mode === 'following'){
+    actionText('地图已变化,小车继续行驶,请观察碰撞');
+  }
+}
+function placeObstacle(r){
+  if (!rectClear(r)) return false;
+  world.obstacles.push(r);
+  afterWorldChange();
+  return true;
+}
+function deleteObstacleAt(wx,wy){
+  for (let i=0;i<world.obstacles.length;i++){
+    const o = world.obstacles[i];
+    if (wx>=o.x && wx<=o.x+o.w && wy>=o.y && wy<=o.y+o.h){
+      world.obstacles.splice(i,1);
+      if (selectedObstacle === o) selectedObstacle = null;
+      afterWorldChange();
+      return true;
+    }
+  }
+  return false;
+}
+function setGoal(wx,wy){
+  if (pointInInflated(wx,wy,GOAL_CLEAR)){ actionText('终点不能设在障碍物内或过近'); return; }
+  if (Math.hypot(wx-start.x, wy-start.y) < 200){ actionText('终点距起点至少 200px'); return; }
+  if (wx < 10 || wy < 10 || wx > W-10 || wy > H-10){ actionText('终点超出世界边界'); return; }
+  goal.x = wx; goal.y = wy;
+  actionText('已设置终点');
+}
+function updateMovingObstacles(dt){
+  if (!moveChk.checked) return;
+  const sp = +moveSpeedRange.value;
+  if (sp <= 0) return;
+  for (const o of world.obstacles){
+    if (!o.patrol || o.patrol.length < 2) continue;
+    const target = o.patrol[o.patrolIdx % o.patrol.length];
+    const dx = target.x - o.x, dy = target.y - o.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 2){
+      o.patrolIdx = (o.patrolIdx + 1) % o.patrol.length;
+    } else {
+      o.x += dx/d*sp*dt;
+      o.y += dy/d*sp*dt;
+    }
+  }
+}
+function doReplan(){
+  if (!algo || algo.id !== 'dlite' || !dliteDirty) return;
+  const after = blockedSet();
+  const changed = diffBlocked(algo.blockedBefore, after);
+  algo.blockedBefore = after;
+  algo.replan(changed);
+  dliteDirty = false; btnReplan.disabled = true;
+  mode = 'searching'; running = true;
+  actionText('D* Lite:增量重规划…');
+}
+
+/* ============ 指标面板 ============ */
+function renderMetrics(){
+  let html = '<div class="m-head"><span>算法</span><span>长度(px)</span><span>扩展</span><span>耗时</span><span>碰撞</span></div>';
+  if (metricsLive.alg){
+    html += '<div class="m-row live"><span>'+metricsLive.alg+'</span><span>'+metricsLive.pathLen.toFixed(0)+'</span><span>'+metricsLive.expanded+'</span><span>'+metricsLive.timeMs.toFixed(0)+'ms</span><span>'+metricsLive.collisions+'</span></div>';
+  }
+  for (const r of metricsHistory){
+    html += '<div class="m-row"><span>'+r.alg+'</span><span>'+r.pathLen.toFixed(0)+'</span><span>'+r.expanded+'</span><span>'+r.timeMs.toFixed(0)+'ms</span><span>'+r.collisions+'</span></div>';
+  }
+  metricsEl.innerHTML = html;
+}
+
+/* ============ 渲染 ============ */
+function rectInView(x,y,w,h,view){
+  return x < view.x1 && x+w > view.x0 && y < view.y1 && y+h > view.y0;
+}
+function cellRect(cell, ctx, view){
+  const x = cell.x*GRID, y = cell.y*GRID;
+  if (!rectInView(x,y,GRID,GRID,view)) return;
+  ctx.fillRect(x,y,GRID,GRID);
+}
+function drawAlgoLayers(ctx, view){
+  const c = COLORS;
+  // 蚁群信息素(琥珀浓度)
+  if (algo && algo.id === 'aco' && algo.pheromone){
+    ctx.fillStyle = '#d99a2b';
+    const x0 = Math.max(0, Math.floor(view.x0/GRID)), x1 = Math.min(grid.cols-1, Math.floor(view.x1/GRID));
+    const y0 = Math.max(0, Math.floor(view.y0/GRID)), y1 = Math.min(grid.rows-1, Math.floor(view.y1/GRID));
+    for (let y=y0;y<=y1;y++) for (let x=x0;x<=x1;x++){
+      const t = algo.pheromone[y*grid.cols+x];
+      if (t > 0.13){
+        ctx.globalAlpha = Math.min(0.7, (t-0.1)*4);
+        ctx.fillRect(x*GRID, y*GRID, GRID, GRID);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  if (vis.replanCells.size){
+    ctx.fillStyle = c.replan;
+    for (const cell of vis.replanCells.values()) cellRect(cell, ctx, view);
+  }
+  if (vis.closedCells.size){
+    ctx.fillStyle = c.closed; ctx.globalAlpha = 0.5;
+    for (const cell of vis.closedCells.values()) cellRect(cell, ctx, view);
+    ctx.globalAlpha = 1;
+  }
+  if (vis.openCells.size){
+    ctx.fillStyle = c.open; ctx.globalAlpha = 0.55;
+    for (const cell of vis.openCells.values()) cellRect(cell, ctx, view);
+    ctx.globalAlpha = 1;
+  }
+  // 网格搜索/D* Lite 树边
+  if (vis.edges.length){
+    ctx.strokeStyle = c.edge; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const ed of vis.edges){
+      if (!rectInView(Math.min(ed.x1,ed.x2), Math.min(ed.y1,ed.y2), Math.abs(ed.x2-ed.x1)+1, Math.abs(ed.y2-ed.y1)+1, view)) continue;
+      ctx.moveTo(ed.x1,ed.y1); ctx.lineTo(ed.x2,ed.y2);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  // PRM / 可见性图 边
+  if (algo && (algo.id === 'prm' || algo.id === 'vgraph') && algo.edges.length){
+    ctx.strokeStyle = '#aab2bd'; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+    ctx.beginPath();
+    for (const ed of algo.edges){
+      const pa = algo.samples[ed[0]], pb = algo.samples[ed[1]];
+      if (!rectInView(Math.min(pa.x,pb.x), Math.min(pa.y,pb.y), Math.abs(pb.x-pa.x)+1, Math.abs(pb.y-pa.y)+1, view)) continue;
+      ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  // RRT 树
+  if (algo && (algo.id === 'rrt' || algo.id === 'rrtstar') && algo.nodes){
+    ctx.lineWidth = 1.2;
+    for (const ed of algo.edges){
+      const na = algo.nodes[ed.a], nb = algo.nodes[ed.b];
+      if (!rectInView(Math.min(na.x,nb.x), Math.min(na.y,nb.y), Math.abs(nb.x-na.x)+1, Math.abs(nb.y-na.y)+1, view)) continue;
+      ctx.strokeStyle = ed.kind === 'rewire' ? c.rewire : c.tree;
+      ctx.beginPath(); ctx.moveTo(na.x,na.y); ctx.lineTo(nb.x,nb.y); ctx.stroke();
+    }
+    ctx.fillStyle = '#8a94a6';
+    for (const n of algo.nodes){
+      if (!rectInView(n.x,n.y,1,1,view)) continue;
+      ctx.beginPath(); ctx.arc(n.x,n.y,2,0,7); ctx.fill();
+    }
+  }
+  // RRT-Connect 双树(树A 蓝灰 / 树B 橙 / 连接绿)
+  if (algo && algo.id === 'rrtconnect'){
+    ctx.lineWidth = 1.2;
+    for (const ed of algo.edges){
+      let na, nb;
+      if (ed.tree === 'conn'){ na = algo.treeA[ed.a]; nb = algo.treeB[ed.b]; }
+      else { const t = ed.tree === 'A' ? algo.treeA : algo.treeB; na = t[ed.a]; nb = t[ed.b]; }
+      if (!rectInView(Math.min(na.x,nb.x), Math.min(na.y,nb.y), Math.abs(nb.x-na.x)+1, Math.abs(nb.y-na.y)+1, view)) continue;
+      ctx.strokeStyle = ed.tree === 'conn' ? c.path : (ed.tree === 'A' ? c.tree : '#f0a35e');
+      ctx.beginPath(); ctx.moveTo(na.x,na.y); ctx.lineTo(nb.x,nb.y); ctx.stroke();
+    }
+    for (const t of [algo.treeA, algo.treeB]){
+      ctx.fillStyle = t === algo.treeA ? '#8a94a6' : '#d9832e';
+      for (const n of t){
+        if (!rectInView(n.x,n.y,1,1,view)) continue;
+        ctx.beginPath(); ctx.arc(n.x,n.y,2,0,7); ctx.fill();
+      }
+    }
+  }
+  // 混合 A* 轨迹
+  if (vis.trajs.length){
+    ctx.strokeStyle = c.traj; ctx.lineWidth = 1.5;
+    for (const ps of vis.trajs){
+      if (!rectInView(ps[0].x, ps[0].y, 1, 1, view)) continue;
+      ctx.beginPath();
+      for (let i=0;i<ps.length;i++){ if (i===0) ctx.moveTo(ps[i].x,ps[i].y); else ctx.lineTo(ps[i].x,ps[i].y); }
+      ctx.stroke();
+    }
+  }
+  // PRM 采样点
+  if (vis.samples.length){
+    ctx.fillStyle = c.sample;
+    for (const p of vis.samples){
+      if (!rectInView(p.x,p.y,1,1,view)) continue;
+      ctx.beginPath(); ctx.arc(p.x,p.y,2.5,0,7); ctx.fill();
+    }
+  }
+  // PRM 搜索 open/closed
+  if (vis.prmOpen.size){
+    ctx.fillStyle = c.open; ctx.globalAlpha = 0.6;
+    for (const p of vis.prmOpen.values()){
+      if (!rectInView(p.x,p.y,1,1,view)) continue;
+      ctx.beginPath(); ctx.arc(p.x,p.y,6,0,7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  if (vis.prmClosed.size){
+    ctx.fillStyle = c.closed; ctx.globalAlpha = 0.6;
+    for (const p of vis.prmClosed.values()){
+      if (!rectInView(p.x,p.y,1,1,view)) continue;
+      ctx.beginPath(); ctx.arc(p.x,p.y,6,0,7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  // 当前扩展点
+  if (vis.current){
+    ctx.fillStyle = c.current;
+    ctx.beginPath(); ctx.arc(vis.current.x, vis.current.y, 5, 0, 7); ctx.fill();
+  }
+  // 蚁群蚂蚁(A 群紫 / B 群橙)
+  if (algo && algo.id === 'aco' && algo.antsA){
+    const groups = [ [algo.antsA, '#8a4baf'], [algo.antsB, '#d9832e'] ];
+    for (const [ants, color] of groups){
+      ctx.fillStyle = color;
+      for (const ant of ants){
+        if (ant.done) continue;
+        const cc = grid.cellCenter(ant);
+        if (!rectInView(cc.x,cc.y,1,1,view)) continue;
+        ctx.beginPath(); ctx.arc(cc.x, cc.y, 3.5, 0, 7); ctx.fill();
+      }
+    }
+  }
+  // 最终路径
+  if (vis.path.length >= 2){
+    ctx.strokeStyle = c.path; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(vis.path[0].x, vis.path[0].y);
+    for (let i=1;i<vis.path.length;i++){
+      if (!rectInView(vis.path[i].x, vis.path[i].y, 1, 1, view)) continue;
+      ctx.lineTo(vis.path[i].x, vis.path[i].y);
+    }
+    ctx.stroke();
+  }
+}
+function drawCar(ctx){
+  if (!car) return;
+  const flash = (mode === 'failed' && car.collided) && (performance.now()-flashStart < 1000) && (Math.floor(performance.now()/100)%2 === 0);
+  const corners = obbCorners(car.x, car.y, car.theta, CAR_L, CAR_W);
+  ctx.fillStyle = flash ? COLORS.flash : COLORS.car;
+  ctx.beginPath(); ctx.moveTo(corners[0][0],corners[0][1]);
+  for (const p of corners) ctx.lineTo(p[0],p[1]);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = COLORS.carEdge; ctx.lineWidth = 1.5; ctx.stroke();
+  // 车轮
+  function wheel(off, ang){
+    const wx = car.x + Math.cos(car.theta)*off, wy = car.y + Math.sin(car.theta)*off;
+    ctx.save(); ctx.translate(wx,wy); ctx.rotate(ang);
+    ctx.fillStyle = COLORS.wheel; ctx.fillRect(-3,-8,6,16);
+    ctx.restore();
+  }
+  wheel(WHEELBASE/2, car.theta + car.delta);
+  wheel(-WHEELBASE/2, car.theta);
+  // 车头指示
+  const nx = car.x + Math.cos(car.theta)*(CAR_L/2+6), ny = car.y + Math.sin(car.theta)*(CAR_L/2+6);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(nx,ny,3,0,7); ctx.fill();
+}
+function render(){
+  c2.fillStyle = COLORS.outside; c2.fillRect(0,0,vw,vh);
+  c2.save();
+  c2.translate(vw/2, vh/2);
+  c2.scale(cam.scale, cam.scale);
+  c2.translate(-cam.x, -cam.y);
+  const view = {
+    x0: (0-vw/2)/cam.scale + cam.x, x1: (vw-vw/2)/cam.scale + cam.x,
+    y0: (0-vh/2)/cam.scale + cam.y, y1: (vh-vh/2)/cam.scale + cam.y
+  };
+  // 世界背景
+  c2.fillStyle = COLORS.bg; c2.fillRect(0,0,W,H);
+  // 网格线
+  if (cam.scale >= 0.8){
+    c2.strokeStyle = COLORS.gridLine; c2.lineWidth = 1;
+    c2.beginPath();
+    for (let x=GRID;x<W;x+=GRID){ if (x<view.x0||x>view.x1) continue; c2.moveTo(x,Math.max(view.y0,0)); c2.lineTo(x,Math.min(view.y1,H)); }
+    for (let y=GRID;y<H;y+=GRID){ if (y<view.y0||y>view.y1) continue; c2.moveTo(Math.max(view.x0,0),y); c2.lineTo(Math.min(view.x1,W),y); }
+    c2.stroke();
+  }
+  c2.strokeStyle = COLORS.worldBorder; c2.lineWidth = 2; c2.strokeRect(0,0,W,H);
+  // 障碍物
+  for (const o of world.obstacles){
+    if (!rectInView(o.x,o.y,o.w,o.h,view)) continue;
+    c2.fillStyle = COLORS.obstacle; c2.fillRect(o.x,o.y,o.w,o.h);
+    c2.strokeStyle = COLORS.obstacleEdge; c2.lineWidth = 1; c2.strokeRect(o.x,o.y,o.w,o.h);
+  }
+  // 选中障碍(移动路径编辑)
+  if (selectedObstacle){
+    c2.strokeStyle = '#f5a623'; c2.lineWidth = 3;
+    c2.strokeRect(selectedObstacle.x, selectedObstacle.y, selectedObstacle.w, selectedObstacle.h);
+    if (selectedObstacle.patrol && selectedObstacle.patrol.length){
+      c2.setLineDash([6,4]); c2.strokeStyle = '#f5a623'; c2.lineWidth = 1.5;
+      c2.beginPath();
+      c2.moveTo(selectedObstacle.x+selectedObstacle.w/2, selectedObstacle.y+selectedObstacle.h/2);
+      for (const p of selectedObstacle.patrol) c2.lineTo(p.x, p.y);
+      c2.stroke(); c2.setLineDash([]);
+      for (const p of selectedObstacle.patrol){
+        c2.beginPath(); c2.arc(p.x, p.y, 5, 0, 7);
+        c2.strokeStyle = '#f5a623'; c2.lineWidth = 2; c2.stroke();
+        c2.fillStyle = '#fff'; c2.fill();
+      }
+    }
+  }
+  drawAlgoLayers(c2, view);
+  // 拖拽放置预览
+  if (mouse.mode === 'place' && mouse.startW && mouse.curW){
+    const x = Math.min(mouse.startW.x,mouse.curW.x), y = Math.min(mouse.startW.y,mouse.curW.y);
+    const w = Math.abs(mouse.curW.x-mouse.startW.x), h = Math.abs(mouse.curW.y-mouse.startW.y);
+    c2.strokeStyle = COLORS.current; c2.lineWidth = 1.5; c2.setLineDash([5,4]);
+    c2.strokeRect(x,y,w,h); c2.setLineDash([]);
+    c2.fillStyle = 'rgba(255,138,92,.15)'; c2.fillRect(x,y,w,h);
+  }
+  // 起点 / 终点
+  c2.fillStyle = COLORS.start;
+  c2.beginPath(); c2.arc(start.x,start.y,10,0,7); c2.fill();
+  c2.strokeStyle = '#fff'; c2.lineWidth = 2; c2.stroke();
+  c2.save(); c2.translate(goal.x,goal.y); c2.rotate(Math.PI/4);
+  c2.fillStyle = COLORS.goal; c2.fillRect(-10,-10,20,20);
+  c2.strokeStyle = '#fff'; c2.lineWidth = 2; c2.strokeRect(-10,-10,20,20);
+  c2.restore();
+  // APF 合力箭头
+  if (vis.force){
+    c2.strokeStyle = COLORS.force; c2.lineWidth = 3;
+    c2.beginPath(); c2.moveTo(vis.force.x,vis.force.y); c2.lineTo(vis.force.x+vis.force.fx, vis.force.y+vis.force.fy); c2.stroke();
+    const ang = Math.atan2(vis.force.fy, vis.force.fx);
+    c2.beginPath();
+    c2.moveTo(vis.force.x+vis.force.fx, vis.force.y+vis.force.fy);
+    c2.lineTo(vis.force.x+vis.force.fx-9*Math.cos(ang-0.5), vis.force.y+vis.force.fy-9*Math.sin(ang-0.5));
+    c2.lineTo(vis.force.x+vis.force.fx-9*Math.cos(ang+0.5), vis.force.y+vis.force.fy-9*Math.sin(ang+0.5));
+    c2.closePath(); c2.fillStyle = COLORS.force; c2.fill();
+  }
+  drawCar(c2);
+  c2.restore();
+}
+
+/* ============ 主循环 ============ */
+function loop(t){
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.1, (t-lastT)/1000 || 0.016);
+  lastT = t;
+  if (mode === 'searching' && running && algo){
+    const n = Math.max(1, Math.ceil(8*speedMult));
+    for (let i=0;i<n;i++){
+      if (algo.done) break;
+      handleEvents(algo.step());
+    }
+    if (algo.done) afterSearchDone();
+  } else if (mode === 'following'){
+    acc += dt;
+    while (acc >= 1/60){
+      followStep(1/60);
+      acc -= 1/60;
+      if (mode !== 'following'){ acc = 0; break; }
+    }
+  }
+  if (mode === 'searching' && algo && algo.metrics){
+    metricsLive.expanded = algo.metrics.expanded;
+    metricsLive.timeMs = performance.now() - algo.t0;
+    if (performance.now() - lastMetricsRender > 200){ lastMetricsRender = performance.now(); renderMetrics(); }
+  }
+  // 相机跟随
+  if (mode === 'following'){ cam.x = car.x; cam.y = car.y; }
+  updateMovingObstacles(dt);
+  render();
+}
+
+/* ============ 输入 ============ */
+function canvasPos(e){
+  const r = canvas.getBoundingClientRect();
+  return { sx: e.clientX-r.left, sy: e.clientY-r.top };
+}
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const { sx, sy } = canvasPos(e);
+  const before = s2w(sx,sy);
+  cam.scale = clamp(cam.scale*(e.deltaY<0?1.1:1/1.1), 0.5, 3);
+  const after = s2w(sx,sy);
+  cam.x += before.x-after.x; cam.y += before.y-after.y;
+}, { passive:false });
+canvas.addEventListener('mousedown', e => {
+  const { sx, sy } = canvasPos(e);
+  const t = document.querySelector('input[name=tool]:checked').value;
+  if (e.button === 0){
+    if (t === 'patrol'){
+      const w = s2w(sx,sy);
+      let hit = null;
+      for (let i=0;i<world.obstacles.length;i++){
+        const o = world.obstacles[i];
+        if (w.x>=o.x && w.x<=o.x+o.w && w.y>=o.y && w.y<=o.y+o.h){ hit = o; break; }
+      }
+      if (hit){
+        selectedObstacle = (selectedObstacle === hit) ? null : hit;
+        actionText(selectedObstacle ? '已选中障碍,点击空地添加路径点' : '已取消选中');
+      } else if (selectedObstacle){
+        if (!selectedObstacle.patrol) selectedObstacle.patrol = [];
+        selectedObstacle.patrol.push({ x:w.x, y:w.y });
+        selectedObstacle.patrolIdx = 0;
+        actionText('已添加路径点 #'+selectedObstacle.patrol.length+'('+w.x.toFixed(0)+','+w.y.toFixed(0)+')');
+      } else {
+        actionText('请先点击一个障碍物进行选择');
+      }
+      return;
+    } else if (t === 'place'){
+      mouse.down = true; mouse.panning = false; mouse.mode = 'place'; mouse.moved = false;
+      mouse.startW = s2w(sx,sy); mouse.curW = null; mouse.button = 0;
+    } else if (t === 'delete'){
+      const w = s2w(sx,sy);
+      if (deleteObstacleAt(w.x,w.y)){ actionText('已删除障碍物'); return; }
+      mouse.down = true; mouse.panning = true; mouse.mode = null; mouse.moved = false;
+      mouse.lastS = [sx,sy]; mouse.button = 0;
+    } else {
+      mouse.down = true; mouse.panning = true; mouse.mode = 'goal'; mouse.moved = false;
+      mouse.lastS = [sx,sy]; mouse.button = 0;
+    }
+  } else {
+    mouse.down = true; mouse.panning = true; mouse.mode = null; mouse.moved = false;
+    mouse.lastS = [sx,sy]; mouse.button = e.button;
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  if (!mouse.down) return;
+  const { sx, sy } = canvasPos(e);
+  if (mouse.mode === 'place'){
+    mouse.curW = s2w(sx,sy);
+    if (mouse.lastS && Math.abs(sx-mouse.lastS[0])+Math.abs(sy-mouse.lastS[1]) > 2) mouse.moved = true;
+    if (!mouse.lastS) mouse.lastS = [sx,sy];
+  } else if (mouse.panning){
+    const dx = sx-mouse.lastS[0], dy = sy-mouse.lastS[1];
+    if (Math.abs(dx)+Math.abs(dy) > 2) mouse.moved = true;
+    cam.x -= dx/cam.scale;
+    cam.y -= dy/cam.scale;
+    mouse.lastS = [sx,sy];
+  }
+});
+canvas.addEventListener('mouseup', e => {
+  if (!mouse.down) return;
+  const { sx, sy } = canvasPos(e);
+  if (mouse.mode === 'place' && mouse.startW && mouse.curW){
+    const x = Math.min(mouse.startW.x,mouse.curW.x), y = Math.min(mouse.startW.y,mouse.curW.y);
+    const w = Math.abs(mouse.curW.x-mouse.startW.x), h = Math.abs(mouse.curW.y-mouse.startW.y);
+    if (w >= 20 && h >= 20){
+      if (placeObstacle({ x, y, w, h })) actionText('已放置障碍物');
+      else actionText('放置失败:与障碍重叠或覆盖起点/终点');
+    } else actionText('障碍物过小(至少 20×20)');
+  } else if (mouse.mode === 'goal' && !mouse.moved){
+    const w = s2w(sx,sy);
+    setGoal(w.x, w.y);
+  }
+  mouse.down = false; mouse.panning = false; mouse.mode = null; mouse.startW = null; mouse.curW = null;
+});
+
+/* ============ UI 绑定 ============ */
+algSel.addEventListener('change', () => {
+  algId = algSel.value;
+  if (mode === 'searching' || mode === 'following') abortRun('已切换算法,中断当前运行');
+});
+coverRange.addEventListener('input', () => {
+  coverTarget = +coverRange.value;
+  coverVal.textContent = coverTarget + '%';
+});
+btnRegen.addEventListener('click', () => {
+  generateObstacles(coverTarget/100);
+  afterWorldChange();
+  actionText('已重新生成障碍物');
+});
+btnStart.addEventListener('click', startSearch);
+btnPlay.addEventListener('click', () => {
+  if (mode === 'searching' || mode === 'following'){ running = true; }
+});
+btnPause.addEventListener('click', () => { running = false; });
+btnStep.addEventListener('click', () => {
+  if (mode === 'searching' && algo && !algo.done){
+    running = false;
+    handleEvents(algo.step());
+    if (algo.done) afterSearchDone();
+  } else if (mode === 'following'){
+    running = false;
+    followStep(1/60);
+  }
+});
+speedSel.addEventListener('change', () => { speedMult = +speedSel.value; });
+speedRange.addEventListener('input', () => { speedVal.textContent = speedRange.value; });
+steerRange.addEventListener('input', () => { steerVal.textContent = steerRange.value + '°'; });
+manualChk.addEventListener('change', () => {
+  manualSteer = manualChk.checked;
+  steerRange.disabled = !manualSteer;
+});
+moveSpeedRange.addEventListener('input', () => { moveSpeedVal.textContent = moveSpeedRange.value; });
+btnClearPatrol.addEventListener('click', () => {
+  if (selectedObstacle){
+    selectedObstacle.patrol = null;
+    selectedObstacle.patrolIdx = 0;
+    actionText('已清除选中障碍的移动路径');
+  } else {
+    actionText('请先选中障碍物');
+  }
+});
+document.querySelectorAll('input[name=path]').forEach(r => r.addEventListener('change', () => { pathMode = document.querySelector('input[name=path]:checked').value; }));
+btnReplan.addEventListener('click', doReplan);
+btnReset.addEventListener('click', () => {
+  abortRun();
+  metricsHistory = [];
+  renderMetrics();
+  actionText('已重置');
+});
+btnResetStart.addEventListener('click', () => {
+  resetCarToStart();
+  cam.x = start.x; cam.y = start.y;
+  actionText('小车已回到起点');
+});
+window.addEventListener('resize', () => { resizeCanvas(); layout(); });
+
+/* ============ 初始化 ============ */
+resizeCanvas();
+generateObstacles(0.12);
+grid.buildFromWorld();
+updateCoverDisplay();
+layout();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
