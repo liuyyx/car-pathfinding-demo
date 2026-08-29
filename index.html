@@ -603,7 +603,7 @@ function createDlite(){
       this.pops = 0; this.t0 = performance.now(); this.path = [];
       this.metrics.pathLen = 0; this.metrics.expanded = 0; this.metrics.timeMs = 0;
       vis.replanCells.clear();
-      vis.path.length = 0; /* 重规划完成前不显示旧路径 */
+      /* 重规划期间保留上一条路径绿线,新路径算好再替换,防止闪烁 */
       for (const cc of changed) vis.replanCells.set(ck(cc), cc);
       for (const cc of changed){
         for (const nb of grid.neighbors8(cc)) this.updateVertex(nb.c);
@@ -1727,9 +1727,12 @@ function autoRetrySearch(reason){
     if (mode === 'failed' || mode === 'searching'){
       if (dynamicStart){
         // 行驶中重规划失败:从当前位置原地重试,车继续巡航不回起点
+        const oldPath = vis.path.slice();
         algo = createAlgorithm(algId);
         const ok = algo.init();
         if (ok){
+          vis.path.length = 0;
+          for (const p of oldPath) vis.path.push(p);
           metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
           mode = 'searching'; running = true; replanning = true;
           actionText(algo.name + ':重试中,从当前位置重新规划…');
@@ -1861,6 +1864,7 @@ function tryReplan(force){
     return;
   }
   // 其他算法:从车当前位置重新搜索
+  const oldPath = vis.path.slice();
   dynamicStart = { x:car.x, y:car.y, theta:car.theta };
   algo = createAlgorithm(algId);
   const ok = algo.init();
@@ -1869,6 +1873,9 @@ function tryReplan(force){
     actionText('重新规划失败:' + (algo.failReason || '未知原因'));
     return;
   }
+  // 重规划搜索期间保留上一条路径绿线,新路径算好再替换,防止闪烁
+  vis.path.length = 0;
+  for (const p of oldPath) vis.path.push(p);
   metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
   mode = 'searching'; running = true; replanning = true;
   actionText(algo.name+':检测到移动障碍,重新规划路径…');
