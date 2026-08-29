@@ -603,6 +603,7 @@ function createDlite(){
       this.pops = 0; this.t0 = performance.now(); this.path = [];
       this.metrics.pathLen = 0; this.metrics.expanded = 0; this.metrics.timeMs = 0;
       vis.replanCells.clear();
+      vis.path.length = 0; /* 重规划完成前不显示旧路径 */
       for (const cc of changed) vis.replanCells.set(ck(cc), cc);
       for (const cc of changed){
         for (const nb of grid.neighbors8(cc)) this.updateVertex(nb.c);
@@ -1557,8 +1558,7 @@ function createACO(){
       if (L < this.bestLen){
         this.bestLen = L;
         this.bestPath = path.slice();
-        vis.path.length = 0;
-        for (const p of path) vis.path.push(grid.cellCenter(p));
+        /* 搜索期间不画最终路径(绿线),收敛完成后再显示 */
       }
     },
     step(){
