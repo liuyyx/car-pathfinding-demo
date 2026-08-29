@@ -93,7 +93,7 @@ window.__errs = [];
 window.onerror = function(m){ window.__errs.push(String(m)); };
 
 /* ============ 常量 ============ */
-const W = 2400, H = 1600, GRID = 24;
+const W = 7600, H = 5060, GRID = 24; /* 面积约为原 2400x1600 的 10 倍 */
 const CAR_L = 56, CAR_W = 32, WHEELBASE = 36;
 const CLEAR = 38; /* 寻路占用网格的障碍物外扩(半车宽12收缩盒+切角余量) */
 const CLEAR_TREE = 52; /* RRT/PRM 树边线段外扩:额外补偿纯追踪在折角处的切角 */
@@ -101,7 +101,7 @@ const GOAL_CLEAR = CLEAR_TREE + 4; /* 终点必须距障碍的距离(保证终�
 const START_R = 90, GOAL_PROT_R = 70;
 const LOOKAHEAD = 60, ARRIVE_DIST = 30;
 const RRT_STEP = 48, GOAL_R = 40, REWIRE_R = 120;
-const PRM_N = 400, PRM_K = 8;
+const PRM_N = 2000, PRM_K = 8; /* 地图扩大后采样点按面积比例增加 */
 const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
 const SQRT2 = Math.SQRT2;
 const COLORS = {
@@ -190,11 +190,16 @@ const grid = {
   buildFromWorld(){
     this.cols = Math.ceil(W/GRID); this.rows = Math.ceil(H/GRID);
     this.free = new Uint8Array(this.cols*this.rows);
-    for (let y=0;y<this.rows;y++) for (let x=0;x<this.cols;x++){
-      const rc = inflated({ x:x*GRID, y:y*GRID, w:GRID, h:GRID });
-      let f = 1;
-      for (const o of world.obstacles){ if (aabbHit(rc,o)){ f=0; break; } }
-      this.free[y*this.cols+x] = f;
+    for (let i=0;i<this.free.length;i++) this.free[i] = 1;
+    // 每个障碍只标记其膨胀后覆盖的 cell 范围(O(障碍×覆盖格),替代逐格×障碍全对检查)
+    for (const o of world.obstacles){
+      const ii = inflated(o);
+      const x0 = Math.max(0, Math.floor(ii.x/GRID)), x1 = Math.min(this.cols-1, Math.floor((ii.x+ii.w)/GRID));
+      const y0 = Math.max(0, Math.floor(ii.y/GRID)), y1 = Math.min(this.rows-1, Math.floor((ii.y+ii.h)/GRID));
+      for (let y=y0;y<=y1;y++){
+        const row = y*this.cols;
+        for (let x=x0;x<=x1;x++) this.free[row+x] = 0;
+      }
     }
   },
   cellAt(wx,wy){ return { x:Math.floor(wx/GRID), y:Math.floor(wy/GRID) }; },
@@ -222,7 +227,7 @@ function generateObstacles(targetCover){
   selectedObstacle = null;
   const totalArea = W*H, targetArea = targetCover*totalArea;
   let area = 0;
-  for (let i=0;i<2000 && area<targetArea;i++){
+  for (let i=0;i<10000 && area<targetArea;i++){
     const w = 40 + Math.random()*100, h = 40 + Math.random()*100;
     const r = { x:Math.random()*(W-w), y:Math.random()*(H-h), w, h };
     if (!rectClear(r)) continue;
@@ -238,7 +243,7 @@ function updateCoverDisplay(){
 let coverTarget = 12;
 
 /* ============ 相机与画布 ============ */
-const cam = { x:start.x, y:start.y, scale:1 };
+const cam = { x:start.x, y:start.y, scale:0.5 };
 function w2s(wx,wy){ return [ (wx-cam.x)*cam.scale + vw/2, (wy-cam.y)*cam.scale + vh/2 ]; }
 function s2w(sx,sy){ return { x:(sx-vw/2)/cam.scale + cam.x, y:(sy-vh/2)/cam.scale + cam.y }; }
 function resizeCanvas(){
@@ -614,11 +619,22 @@ function createDlite(){
 
 /* ============ RRT / RRT* ============ */
 function segmentFree(a,b){
+  const minx = Math.min(a.x,b.x), maxx = Math.max(a.x,b.x);
+  const miny = Math.min(a.y,b.y), maxy = Math.max(a.y,b.y);
+  const nearby = [];
+  for (const o of world.obstacles){
+    if (o.x+o.w < minx-CLEAR_TREE || o.x > maxx+CLEAR_TREE || o.y+o.h < miny-CLEAR_TREE || o.y > maxy+CLEAR_TREE) continue;
+    nearby.push(inflated(o, CLEAR_TREE));
+  }
+  if (nearby.length === 0) return true;
   const d = Math.hypot(b.x-a.x, b.y-a.y);
   const n = Math.max(1, Math.ceil(d/6));
   for (let i=0;i<=n;i++){
     const t = i/n;
-    if (!pointFree(a.x+(b.x-a.x)*t, a.y+(b.y-a.y)*t)) return false;
+    const px = a.x+(b.x-a.x)*t, py = a.y+(b.y-a.y)*t;
+    for (const ii of nearby){
+      if (px >= ii.x && px <= ii.x+ii.w && py >= ii.y && py <= ii.y+ii.h) return false;
+    }
   }
   return true;
 }
@@ -664,6 +680,7 @@ function createRRT(rrtstar){
     },
     step(){
       const events = [];
+      for (let s2=0; s2<4 && !this.done; s2++){
       this.iter++;
       this.metrics.timeMs = performance.now()-this.t0;
       let sx, sy;
@@ -732,6 +749,8 @@ function createRRT(rrtstar){
             events.push({ type:'info', text:name+':新增节点 #'+this.nodes.length });
           }
         }
+        }
+        if (this.done) break;
       }
       return events;
     }
@@ -775,7 +794,7 @@ function createPRM(){
       } else if (this.phase === 'graph'){
         const si = this.si;
         const p = this.samples[si];
-        const kLimit = (si === this.startIdx || si === this.goalIdx) ? 24 : PRM_K;
+        const kLimit = (si === this.startIdx || si === this.goalIdx) ? 40 : PRM_K;
         const order = [];
         for (let j=0;j<this.samples.length;j++){
           if (j === si) continue;
@@ -1265,6 +1284,7 @@ function createRRTConnect(){
     },
     step(){
       const events = [];
+      for (let s2=0; s2<4 && !this.done; s2++){
       this.iter++;
       this.metrics.timeMs = performance.now()-this.t0;
       const isA = this.turn;
@@ -1281,7 +1301,7 @@ function createRRTConnect(){
       else { px = near.node.x + (sx-near.node.x)/near.dist*RRT_STEP; py = near.node.y + (sy-near.node.y)/near.dist*RRT_STEP; }
       if (!segmentFree(near.node, {x:px, y:py})){
         this.turn = !this.turn;
-        return events;
+        continue;
       }
       tree.push({ x:px, y:py, parent:near.idx });
       const aIdx = tree.length - 1;
@@ -1321,6 +1341,8 @@ function createRRTConnect(){
       this.metrics.expanded = this.treeA.length + this.treeB.length;
       if (!this.done) events.push({ type:'info', text:'RRT-Connect:树'+tName+' 生长,节点 '+(this.treeA.length+this.treeB.length) });
       this.turn = !this.turn;
+      if (this.done) break;
+      }
       return events;
     }
   };
@@ -1329,11 +1351,23 @@ function createRRTConnect(){
 
 /* ============ 可见性图 ============ */
 function segmentFreeInfl(a,b){
+  const minx = Math.min(a.x,b.x), maxx = Math.max(a.x,b.x);
+  const miny = Math.min(a.y,b.y), maxy = Math.max(a.y,b.y);
+  // bbox 粗筛:只对线段包围盒相交的障碍做膨胀采样检查
+  const nearby = [];
+  for (const o of world.obstacles){
+    if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
+    nearby.push(inflated(o, CLEAR));
+  }
+  if (nearby.length === 0) return true;
   const d = Math.hypot(b.x-a.x, b.y-a.y);
   const n = Math.max(1, Math.ceil(d/6));
   for (let i=0;i<=n;i++){
     const t = i/n;
-    if (pointInInflated(a.x+(b.x-a.x)*t, a.y+(b.y-a.y)*t, CLEAR)) return false;
+    const px = a.x+(b.x-a.x)*t, py = a.y+(b.y-a.y)*t;
+    for (const ii of nearby){
+      if (px >= ii.x && px <= ii.x+ii.w && py >= ii.y && py <= ii.y+ii.h) return false;
+    }
   }
   return true;
 }
@@ -1369,16 +1403,30 @@ function createVGraph(){
     step(){
       const events = [];
       if (this.phase === 'build'){
+        for (let k2=0; k2<4 && this.si < this.nodes.length; k2++){
         const si = this.si;
         const p = this.nodes[si];
+        // 大图下不全对连线:按距离取 k=20 近邻尝试(含 bbox 粗筛的线段检查)
+        const order = [];
         for (let j=0;j<this.nodes.length;j++){
           if (j === si || this.adj[si].has(j)) continue;
+          const dx = p.x-this.nodes[j].x, dy = p.y-this.nodes[j].y;
+          order.push([j, dx*dx+dy*dy]);
+        }
+        order.sort((a,b)=>a[1]-b[1]);
+        const kLimit = (si === this.startIdx || si === this.goalIdx) ? 40 : 20;
+        let added = 0;
+        for (let t2=0;t2<order.length && added<kLimit;t2++){
+          const j = order[t2][0];
+          if (this.adj[si].has(j)) continue;
           if (segmentFreeInfl(p, this.nodes[j])){
             this.adj[si].add(j); this.adj[j].add(si);
             this.edges.push([si, j]);
+            added++;
           }
         }
         this.si++;
+        }
         this.metrics.expanded = this.si;
         this.metrics.timeMs = performance.now()-this.t0;
         if (this.si >= this.nodes.length){
@@ -1390,7 +1438,7 @@ function createVGraph(){
           this.open.push({ i:s0, g:0, f:dist(this.nodes[s0], this.nodes[this.goalIdx]) });
           events.push({ type:'info', text:'可见性图:图构建完成('+this.nodes.length+' 顶点),图上搜索…' });
         } else {
-          events.push({ type:'info', text:'可见性图:连接顶点 '+si+'/'+this.nodes.length });
+          events.push({ type:'info', text:'可见性图:连接顶点 '+this.si+'/'+this.nodes.length });
         }
         return events;
       }
@@ -1452,7 +1500,7 @@ function createACO(){
       this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
-      this.ANT_N = 16; this.ANT_MAX = 320; this.MAX_ITER = 80;
+      this.ANT_N = 16; this.ANT_MAX = 900; this.MAX_ITER = 80;
       this.ALPHA = 1; this.BETA = 3; this.RHO = 0.12; this.Q = 100;
       // A 群(朝终点)偏贪心推进;B 群(朝起点)偏随机扩散覆盖,两群相遇合并
       this.GREEDY_A = 0.7; this.GREEDY_B = 0.3;
@@ -1519,7 +1567,7 @@ function createACO(){
       for (const ant of this.antsA){
         if (ant.done) continue;
         anyActive = true;
-        for (let mv=0; mv<2; mv++){
+        for (let mv=0; mv<4; mv++){
           ant.steps++;
           if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
           this.moveAnt(ant, this.goalC, false);
@@ -1550,7 +1598,7 @@ function createACO(){
       for (const ant of this.antsB){
         if (ant.done) continue;
         anyActive = true;
-        for (let mv=0; mv<2; mv++){
+        for (let mv=0; mv<4; mv++){
           ant.steps++;
           if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
           this.moveAnt(ant, this.startC, true);
@@ -1667,14 +1715,30 @@ function startSearch(){
 }
 let __retryCount = 0;
 function autoRetrySearch(reason){
-  /* 仅移动障碍启用时:搜索未找到路径 → 等待障碍移开自动重试 */
+  /* 仅移动障碍启用时:搜索未找到路径 → 等待障碍移开自动重试
+     行驶中(动态起点)重试保持当前位置,不把车拉回起点 */
   if (!moveChk.checked) return false;
   if (__retryCount >= 6) return false;
   __retryCount++;
   actionText(reason + ',移动障碍移动中,自动重试(' + __retryCount + '/6)…');
   setTimeout(() => {
     __retryCount--;
-    if (mode === 'failed' || mode === 'searching') startSearch();
+    if (mode === 'failed' || mode === 'searching'){
+      if (dynamicStart){
+        // 行驶中重规划失败:从当前位置原地重试,车继续巡航不回起点
+        algo = createAlgorithm(algId);
+        const ok = algo.init();
+        if (ok){
+          metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
+          mode = 'searching'; running = true; replanning = true;
+          actionText(algo.name + ':重试中,从当前位置重新规划…');
+        } else {
+          actionText('重试失败:' + (algo.failReason || '未知原因'));
+        }
+      } else {
+        startSearch();
+      }
+    }
   }, 600);
   return true;
 }
@@ -1926,6 +1990,28 @@ function updateMovingObstacles(dt){
   const carRect = carClearRect();
   const goalRect = { x: goal.x - GOAL_CLEAR, y: goal.y - GOAL_CLEAR, w: GOAL_CLEAR*2, h: GOAL_CLEAR*2 };
   const startRect = { x: start.x - START_R, y: start.y - START_R, w: START_R*2, h: START_R*2 };
+  // 空间桶:大障碍数量下避免全对碰撞检查
+  const BS = 200;
+  const buckets = new Map();
+  for (const o of world.obstacles){
+    const bx = Math.floor(o.x/BS), by = Math.floor(o.y/BS);
+    const k = bx + ',' + by;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(o);
+  }
+  const blockedByOthers = (nx, ny, w, h, self) => {
+    const x0 = Math.floor(nx/BS), x1 = Math.floor((nx+w)/BS);
+    const y0 = Math.floor(ny/BS), y1 = Math.floor((ny+h)/BS);
+    for (let by=y0;by<=y1;by++) for (let bx=x0;bx<=x1;bx++){
+      const arr = buckets.get(bx + ',' + by);
+      if (!arr) continue;
+      for (const other of arr){
+        if (other === self) continue;
+        if (aabbHit({ x:nx, y:ny, w:w, h:h }, other)) return true;
+      }
+    }
+    return false;
+  };
   for (const o of world.obstacles){
     // 巡逻模式(手动路径点)优先
     if (o.patrol && o.patrol.length >= 2){
@@ -1938,11 +2024,7 @@ function updateMovingObstacles(dt){
         // 巡逻途中也避免与其他障碍及小车重叠
         const nx = o.x + dx/d*sp*dt, ny = o.y + dy/d*sp*dt;
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
-        let clear = true;
-        for (const other of world.obstacles){
-          if (other === o) continue;
-          if (aabbHit(nrect, other)){ clear = false; break; }
-        }
+        let clear = !blockedByOthers(nx, ny, o.w, o.h, o);
         if (clear && aabbHit(nrect, carRect)) clear = false;
         if (clear && aabbHit(nrect, goalRect)) clear = false;
         if (clear && aabbHit(nrect, startRect)) clear = false;
@@ -1979,11 +2061,7 @@ function updateMovingObstacles(dt){
         const nx = o.x + vx*stepSp*dt, ny = o.y + vy*stepSp*dt;
         if (nx < 0 || nx+o.w > W || ny < 0 || ny+o.h > H) continue;
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
-        let clear = true;
-        for (const other of world.obstacles){
-          if (other === o) continue;
-          if (aabbHit(nrect, other)){ clear = false; break; }
-        }
+        let clear = !blockedByOthers(nx, ny, o.w, o.h, o);
         if (clear && aabbHit(nrect, carRect)) clear = false;
         if (clear && aabbHit(nrect, goalRect)) clear = false;
         if (clear && aabbHit(nrect, startRect)) clear = false;
@@ -2289,10 +2367,15 @@ function loop(t){
   const dt = Math.min(0.1, (t-lastT)/1000 || 0.016);
   lastT = t;
   if (mode === 'searching' && running && algo){
-    const n = Math.max(1, Math.ceil(8*speedMult));
-    for (let i=0;i<n;i++){
-      if (algo.done) break;
+    // 每帧步数上限(1×=80 步,探索动画清晰可见;倍速平方放大快进)
+    // 时间预算兜底:重规划 6ms 保流畅,手动搜索 15ms
+    const stepLimit = Math.max(80, 80 * speedMult * speedMult);
+    const budget = replanning ? 6 : 15;
+    const bStart = performance.now();
+    let steps = 0;
+    while (performance.now() - bStart < budget && steps < stepLimit && !algo.done){
       handleEvents(algo.step());
+      steps++;
     }
     if (algo.done) afterSearchDone();
     else if (replanning && tracker && mode === 'searching'){
@@ -2334,7 +2417,7 @@ canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const { sx, sy } = canvasPos(e);
   const before = s2w(sx,sy);
-  cam.scale = clamp(cam.scale*(e.deltaY<0?1.1:1/1.1), 0.5, 3);
+  cam.scale = clamp(cam.scale*(e.deltaY<0?1.1:1/1.1), 0.15, 4);
   const after = s2w(sx,sy);
   cam.x += before.x-after.x; cam.y += before.y-after.y;
 }, { passive:false });
