@@ -90,14 +90,17 @@
 
 <script>
 'use strict';
-window.__errs = [];
-window.onerror = function(m){ window.__errs.push(String(m)); };
+const IS_WORKER = typeof window === 'undefined';
+if (!IS_WORKER){
+  window.__errs = [];
+  window.onerror = function(m){ window.__errs.push(String(m)); };
+}
 
 /* ============ 常量 ============ */
 const W = 7600, H = 5060, GRID = 24; /* 面积约为原 2400x1600 的 10 倍 */
 const CAR_L = 56, CAR_W = 32, WHEELBASE = 36;
-const CLEAR = 38; /* 寻路占用网格的障碍物外扩(半车宽12收缩盒+切角余量) */
-const CLEAR_TREE = 52; /* RRT/PRM 树边线段外扩:额外补偿纯追踪在折角处的切角 */
+const CLEAR = 24; /* 寻路占用网格的障碍物外扩(半车宽16收缩盒+切角余量,已缩至最小安全) */
+const CLEAR_TREE = 34; /* RRT/PRM 树边线段外扩:额外补偿纯追踪在折角处的切角 */
 const GOAL_CLEAR = CLEAR_TREE + 4; /* 终点必须距障碍的距离(保证终点格自由且 RRT/PRM 可连接) */
 const START_R = 90, GOAL_PROT_R = 70;
 const LOOKAHEAD = 60, ARRIVE_DIST = 30;
@@ -133,15 +136,16 @@ const ALGORITHMS = [
 
 /* ============ DOM ============ */
 const $ = id => document.getElementById(id);
-const canvas = $('cv'), c2 = canvas.getContext('2d');
-const actionEl = $('actionText'), metricsEl = $('metrics'), toolbarEl = $('toolbar');
-const algSel = $('algSel'), coverRange = $('coverRange'), coverVal = $('coverVal');
-const btnRegen = $('btnRegen'), btnStart = $('btnStart'), btnPlay = $('btnPlay'), btnPause = $('btnPause');
-const btnStep = $('btnStep'), speedSel = $('speedSel'), speedRange = $('speedRange'), speedVal = $('speedVal');
-const steerRange = $('steerRange'), steerVal = $('steerVal'), manualChk = $('manualChk');
-const btnReplan = $('btnReplan'), btnReset = $('btnReset'), btnResetStart = $('btnResetStart');
-const moveChk = $('moveChk'), persistChk = $('persistChk'), moveSpeedRange = $('moveSpeedRange'), moveSpeedVal = $('moveSpeedVal'), btnRandomMove = $('btnRandomMove'), btnClearPatrol = $('btnClearPatrol');
-ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
+const canvas = IS_WORKER ? null : $('cv');
+const c2 = IS_WORKER ? null : (canvas ? canvas.getContext('2d') : null);
+const actionEl = IS_WORKER ? null : $('actionText'), metricsEl = IS_WORKER ? null : $('metrics'), toolbarEl = IS_WORKER ? null : $('toolbar');
+const algSel = IS_WORKER ? null : $('algSel'), coverRange = IS_WORKER ? null : $('coverRange'), coverVal = IS_WORKER ? null : $('coverVal');
+const btnRegen = IS_WORKER ? null : $('btnRegen'), btnStart = IS_WORKER ? null : $('btnStart'), btnPlay = IS_WORKER ? null : $('btnPlay'), btnPause = IS_WORKER ? null : $('btnPause');
+const btnStep = IS_WORKER ? null : $('btnStep'), speedSel = IS_WORKER ? null : $('speedSel'), speedRange = IS_WORKER ? null : $('speedRange'), speedVal = IS_WORKER ? null : $('speedVal');
+const steerRange = IS_WORKER ? null : $('steerRange'), steerVal = IS_WORKER ? null : $('steerVal'), manualChk = IS_WORKER ? null : $('manualChk');
+const btnReplan = IS_WORKER ? null : $('btnReplan'), btnReset = IS_WORKER ? null : $('btnReset'), btnResetStart = IS_WORKER ? null : $('btnResetStart');
+const moveChk = IS_WORKER ? null : $('moveChk'), persistChk = IS_WORKER ? null : $('persistChk'), moveSpeedRange = IS_WORKER ? null : $('moveSpeedRange'), moveSpeedVal = IS_WORKER ? null : $('moveSpeedVal'), btnRandomMove = IS_WORKER ? null : $('btnRandomMove'), btnClearPatrol = IS_WORKER ? null : $('btnClearPatrol');
+if (!IS_WORKER) ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
 
 /* ============ 状态 ============ */
 const world = { obstacles: [] };
@@ -157,7 +161,7 @@ let replanning = false; /* 重规划进行中:车沿旧轨迹巡航不停车 */
 function algoStart(){ return dynamicStart || start; }
 let lastT = performance.now(), acc = 0, lastMetricsRender = 0;
 let vw = 0, vh = 0;
-const vis = {
+const vis = IS_WORKER ? mkWorkerVis() : {
   openCells:new Map(), closedCells:new Map(), current:null,
   edges:[], samples:[], replanCells:new Map(), trajs:[],
   path:[], force:null, prmOpen:new Map(), prmClosed:new Map()
@@ -293,10 +297,46 @@ function vehicleCollides(c,obs){
   for (const o of obs) if (obbRectHit(c.x,c.y,c.theta,o,HIT_L,HIT_W)) return true;
   return false;
 }
+/* 混合 A* 碰撞分桶:按障碍 12px 膨胀盒建空间桶,只测车体附近障碍(原全障碍 O(589) 扫描) */
+const BUCKET = 96, PROBE_PAD = 40; /* 桶 96px;车体半长 28 + 12 膨胀 */
+let obsBuckets = null;
+function buildObstacleBuckets(){
+  obsBuckets = new Map();
+  const bw = Math.ceil(W/BUCKET), bh = Math.ceil(H/BUCKET);
+  for (let i=0;i<world.obstacles.length;i++){
+    const o = world.obstacles[i];
+    const bx0 = Math.max(0, Math.floor((o.x-12)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((o.x+o.w+12)/BUCKET));
+    const by0 = Math.max(0, Math.floor((o.y-12)/BUCKET)), by1 = Math.min(bh-1, Math.floor((o.y+o.h+12)/BUCKET));
+    for (let by=by0;by<=by1;by++) for (let bx=bx0;bx<=bx1;bx++){
+      const k = by*bw+bx;
+      let arr = obsBuckets.get(k);
+      if (!arr){ arr = []; obsBuckets.set(k, arr); }
+      arr.push(i);
+    }
+  }
+}
 function probeCollides(x,y,theta){
-  for (const o of world.obstacles){
-    // 混合 A* 轨迹为弧线段,折角处跟随会切角;碰撞检查加 12px 膨胀补偿
-    if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+  if (!obsBuckets){
+    for (const o of world.obstacles){
+      // 混合 A* 轨迹为弧线段,折角处跟随会切角;碰撞检查加 12px 膨胀补偿
+      if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+    }
+    return false;
+  }
+  const bw = Math.ceil(W/BUCKET), bh = Math.ceil(H/BUCKET);
+  const bx0 = Math.max(0, Math.floor((x-PROBE_PAD)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((x+PROBE_PAD)/BUCKET));
+  const by0 = Math.max(0, Math.floor((y-PROBE_PAD)/BUCKET)), by1 = Math.min(bh-1, Math.floor((y+PROBE_PAD)/BUCKET));
+  const seen = [];
+  for (let by=by0;by<=by1;by++) for (let bx=bx0;bx<=bx1;bx++){
+    const arr = obsBuckets.get(by*bw+bx);
+    if (!arr) continue;
+    for (let ai=0;ai<arr.length;ai++){
+      const oi = arr[ai];
+      if (seen.indexOf(oi) >= 0) continue;
+      seen.push(oi);
+      const o = world.obstacles[oi];
+      if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+    }
   }
   return false;
 }
@@ -361,6 +401,52 @@ class MinHeap {
 }
 
 /* ============ 可视化状态 ============ */
+/* Worker 端 vis:Proxy 代理记录增量操作序列,每批回传主线程重放 */
+function mkWorkerVis(){
+  const inc = [];
+  const mkMap = (name) => new Proxy(new Map(), {
+    set(t,k,v){ t.set(k,v); inc.push(['ms',name,k,v]); return true; },
+    deleteProperty(t,k){ const had=t.has(k); t.delete(k); if(had) inc.push(['md',name,k]); return true; },
+    get(t,p){
+      if (p==='clear') return () => { t.clear(); inc.push(['mc',name]); };
+      if (p==='size') return t.size;
+      const v=t[p]; return typeof v==='function' ? v.bind(t) : v;
+    }
+  });
+  const mkArr = (name) => {
+    const a = [];
+    return new Proxy(a, {
+      set(t,p,v){
+        if (p==='length'){ t.length=v; inc.push(['al',name,v]); return true; }
+        if (typeof p==='string' && /^\d+$/.test(p)){ t[p]=v; inc.push(['ap',name,v]); return true; }
+        t[p]=v; return true;
+      },
+      get(t,p){
+        if (p==='push') return (v)=>{ t.push(v); inc.push(['ap',name,v]); return t.length; };
+        if (p==='length') return t.length;
+        const v=t[p]; return typeof v==='function' ? v.bind(t) : v;
+      }
+    });
+  };
+  const vis = {
+    openCells: mkMap('openCells'), closedCells: mkMap('closedCells'), current:null,
+    edges: mkArr('edges'), samples: [], replanCells: mkMap('replanCells'), trajs: mkArr('trajs'),
+    path: mkArr('path'), force:null, prmOpen: mkMap('prmOpen'), prmClosed: mkMap('prmClosed')
+  };
+  const root = new Proxy(vis, {
+    set(t,p,v){
+      if (p==='current'){ t.current=v; inc.push(['cur',v]); return true; }
+      if (p==='force'){ t.force=v; inc.push(['force',v]); return true; }
+      if (p==='samples'){ t.samples=v; inc.push(['samples',v]); return true; }
+      t[p]=v; return true;
+    },
+    get(t,p){
+      if (p==='__drain') return () => { const out = inc.slice(); inc.length = 0; return out; };
+      const v=t[p]; return typeof v==='function' ? v.bind(t) : v;
+    }
+  });
+  return root;
+}
 function visReset(){
   vis.openCells.clear(); vis.closedCells.clear(); vis.current=null;
   vis.edges.length=0; vis.samples.length=0; vis.replanCells.clear(); vis.trajs.length=0;
@@ -970,9 +1056,11 @@ function createHybridAstar(){
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
       grid.buildFromWorld();
+      buildObstacleBuckets();
+      this.buildDistField();
       this.open = new MinHeap((x,y)=>x.f-y.f);
       this.gMap = new Map(); this.closed = new Set();
-      this.pops = 0; this.t0 = performance.now();
+      this.pops = 0; this.trajCount = 0; this.t0 = performance.now();
       const s0 = algoStart();
       this.s0 = this.mkState(s0.x, s0.y, s0.theta || 0, 0, null);
       this.gMap.set(this.s0.key, this.s0);
@@ -980,7 +1068,56 @@ function createHybridAstar(){
       visReset();
       return true;
     },
-    h(s){ return Math.hypot(goal.x-s.x, goal.y-s.y); },
+    /* 从 goal 最近自由格做 8 邻域 BFS 距离场(格单位),作为可采纳避障启发式 */
+    buildDistField(){
+      const cols = grid.cols, rows = grid.rows;
+      this.distField = new Float32Array(cols*rows).fill(Infinity);
+      const gx = Math.floor(goal.x/GRID), gy = Math.floor(goal.y/GRID);
+      let sg = -1;
+      for (let r=0; r<60 && sg<0; r++){
+        for (let dy=-r; dy<=r && sg<0; dy++) for (let dx=-r; dx<=r && sg<0; dx++){
+          const cx = clamp(gx+dx,0,cols-1), cy = clamp(gy+dy,0,rows-1);
+          if (grid.free[cy*cols+cx]) sg = cy*cols+cx;
+        }
+      }
+      if (sg < 0) return;
+      this.distField[sg] = 0;
+      const q = [sg]; let head = 0;
+      const done = new Uint8Array(cols*rows); done[sg] = 1;
+      while (head < q.length){
+        const k = q[head++], cx = k % cols, cy = (k/cols)|0, d = this.distField[k];
+        for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
+          if (!dx && !dy) continue;
+          const nx = cx+dx, ny = cy+dy;
+          if (nx<0||nx>=cols||ny<0||ny>=rows) continue;
+          const nk = ny*cols+nx;
+          if (!grid.free[nk] || done[nk]) continue;
+          done[nk] = 1;
+          this.distField[nk] = d + (dx && dy ? SQRT2 : 1);
+          q.push(nk);
+        }
+      }
+    },
+    h(s){
+      const gx = Math.floor(s.x/GRID), gy = Math.floor(s.y/GRID);
+      const eu = Math.hypot(goal.x-s.x, goal.y-s.y);
+      if (gx<0||gx>=grid.cols||gy<0||gy>=grid.rows) return eu;
+      const d = this.distField[gy*grid.cols+gx];
+      return isFinite(d) ? Math.min(d*GRID, eu) : eu;
+    },
+    /* 车朝向与终点方向偏差 <45° 且直线无碰撞 → 直接收尾,省整段网格扩展 */
+    lineToGoal(s){
+      const ang = Math.atan2(goal.y-s.y, goal.x-s.x);
+      if (Math.abs(normAngle(ang - s.theta)) > Math.PI/4) return false;
+      const d = Math.hypot(goal.x-s.x, goal.y-s.y);
+      if (d < 60) return true;
+      const steps = Math.max(1, Math.floor(d/20));
+      for (let i=1;i<=steps;i++){
+        const t = i/steps;
+        if (probeCollides(s.x+(goal.x-s.x)*t, s.y+(goal.y-s.y)*t, ang)) return false;
+      }
+      return true;
+    },
     mkState(x,y,theta,g,parent){
       const gi = ((Math.round(theta/(Math.PI*2/16))%16)+16)%16;
       const key = Math.floor(x/GRID)+','+Math.floor(y/GRID)+','+gi;
@@ -1029,6 +1166,14 @@ function createHybridAstar(){
       const ck2 = Math.floor(s.x/GRID)+','+Math.floor(s.y/GRID);
       vis.closedCells.set(ck2, { x:Math.floor(s.x/GRID), y:Math.floor(s.y/GRID) });
       vis.current = { x:s.x, y:s.y };
+      if (this.lineToGoal(s)){
+        this.path = this.backtrace(s);
+        this.path.push({ x:goal.x, y:goal.y });
+        this.done = true;
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'混合 A*:直线直达,扩展 '+this.pops+' 状态' });
+        return events;
+      }
       if (Math.hypot(s.x-goal.x, s.y-goal.y) < 40){
         this.path = this.backtrace(s);
         this.path.push({ x:goal.x, y:goal.y });
@@ -1063,7 +1208,12 @@ function createHybridAstar(){
           ns.traj = poses;
           this.gMap.set(ns.key, ns);
           this.open.push({ s:ns, f:cost+this.h(ns) });
-          vis.trajs.push(poses);
+          /* trajs 节流:每 8 次扩展显示一条弧,超 1200 条清空,防渲染/内存随搜索线性增长 */
+          this.trajCount++;
+          if (this.trajCount % 8 === 0){
+            if (vis.trajs.length > 1200) vis.trajs.length = 0;
+            vis.trajs.push(poses);
+          }
           const ck3 = Math.floor(end.x/GRID)+','+Math.floor(end.y/GRID);
           vis.openCells.set(ck3, { x:Math.floor(end.x/GRID), y:Math.floor(end.y/GRID) });
           events.push({ type:'traj' });
@@ -1699,6 +1849,115 @@ function createACO(){
   return a;
 }
 
+/* ============ Worker 并行搜索(主线程侧) ============ */
+const COMPETE_IDS = new Set(['rrt','rrtstar','rrtconnect','prm','aco','apf']);
+let workerOk = false, worker1 = null, worker2 = null, pendingBatches = [];
+function mkSearchWorker(){
+  try{
+    if (typeof Worker === 'undefined' || typeof URL === 'undefined' || typeof Blob === 'undefined') return null;
+    const src = document.currentScript ? document.currentScript.textContent : '';
+    if (!src) return null;
+    return new Worker(URL.createObjectURL(new Blob([src], { type:'text/javascript' })));
+  }catch(err){ return null; }
+}
+function setupWorkers(){
+  worker1 = mkSearchWorker();
+  if (!worker1) return;
+  workerOk = true;
+  worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
+  if (COMPETE_IDS.has(algId)){
+    worker2 = mkSearchWorker();
+    if (worker2) worker2.onmessage = (e) => handleWorkerMsg(2, e.data);
+  }
+}
+function workerAlgoShadow(id){
+  const def = ALGORITHMS.find(a=>a.id===id);
+  return { id, name: def ? def.name : id, done:false, path:[], failReason:'', metrics:{ expanded:0, timeMs:0 },
+    antsA:null, antsB:null, pheromone:null, replanRun:false, hasPlan:false };
+}
+function applyInc(inc){
+  if (!inc) return;
+  for (const it of inc){
+    const t = it[0];
+    if (t==='ms'){ const n=it[1],k=it[2],v=it[3]; if (vis[n] && vis[n].set) vis[n].set(k,v); }
+    else if (t==='md'){ const n=it[1],k=it[2]; if (vis[n] && vis[n].delete) vis[n].delete(k); }
+    else if (t==='mc'){ const n=it[1]; if (vis[n] && vis[n].clear) vis[n].clear(); }
+    else if (t==='ap'){ const n=it[1],v=it[2]; if (vis[n] && vis[n].push) vis[n].push(v); }
+    else if (t==='al'){ const n=it[1],len=it[2]; if (vis[n]) vis[n].length = len; }
+    else if (t==='cur'){ vis.current = it[1]; }
+    else if (t==='force'){ vis.force = it[1]; }
+    else if (t==='samples'){ vis.samples = it[1]; }
+  }
+}
+function handleWorkerMsg(src, m){
+  if (src === 2 && m.type === 'done' && algo && !algo.done){
+    // 竞争 worker 先找到:采用其结果,终止主 worker
+    algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
+    algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
+    algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
+    if (worker1) worker1.postMessage({ cmd:'abort' });
+    pendingBatches.length = 0;
+    return;
+  }
+  if (src !== 1) return;
+  if (m.type === 'init'){
+    workerInitPending = false;
+    if (m.ok){
+      workerReplanPending = false;
+      if (algo && algo.id === 'dlite') algo.blockedBefore = blockedSet();
+    } else {
+      afterAlgoInit(false, m.failReason || '初始化失败');
+    }
+    return;
+  }
+  if (m.type === 'info'){ actionText(m.text); return; }
+  if (m.type === 'batch'){
+    pendingBatches.push(m.inc);
+    if (pendingBatches.length > 24) pendingBatches.splice(0, pendingBatches.length - 24);
+    if (algo){
+      algo.metrics.expanded = m.expanded;
+      algo.metrics.timeMs = m.timeMs;
+      if (m.antsA || m.antsB){ algo.antsA = m.antsA; algo.antsB = m.antsB; }
+    }
+    return;
+  }
+  if (m.type === 'done'){
+    algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
+    algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
+    algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
+    if (worker2) worker2.postMessage({ cmd:'abort' });
+    pendingBatches.length = 0;
+  }
+}
+let workerInitPending = false, workerReplanPending = false;
+function postWorkerStart(params){
+  if (!workerOk || !worker1) return;
+  pendingBatches.length = 0;
+  algo = workerAlgoShadow(params.algoId);
+  algo.blockedBefore = null;
+  if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
+  if (COMPETE_IDS.has(params.algoId)){
+    worker2 = mkSearchWorker();
+    if (worker2) worker2.onmessage = (e) => handleWorkerMsg(2, e.data);
+  }
+  worker1.postMessage({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
+    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed: 1 });
+  if (worker2) worker2.postMessage({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
+    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed: 2 });
+  workerInitPending = true;
+}
+function postWorkerReplanDlite(changed, blockedAfter){
+  if (!workerOk || !worker1 || !algo) return;
+  pendingBatches.length = 0;
+  algo.blockedBefore = blockedAfter;
+  worker1.postMessage({ cmd:'replanDlite', changed, blockedBefore: blockedAfter, obstacles: world.obstacles });
+  workerReplanPending = true;
+}
+function workerAbort(){
+  if (worker1) try{ worker1.postMessage({ cmd:'abort' }); }catch(e){}
+  if (worker2) try{ worker2.postMessage({ cmd:'abort' }); }catch(e){}
+}
+
 /* ============ 算法工厂 ============ */
 function createAlgorithm(id){
   switch (id){
@@ -1734,18 +1993,32 @@ function startSearch(){
   if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
   dynamicStart = null;
   resetCarToStart();
+  if (workerOk){
+    postWorkerStart({ algoId: algId, obstacles: world.obstacles,
+      goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart: null });
+    actionText(ALGORITHMS.find(a=>a.id===algId).name+':开始搜索…(多线程)');
+    return;
+  }
   algo = createAlgorithm(algId);
   const ok = algo.init();
+  afterAlgoInit(ok, algo.failReason);
+}
+function afterAlgoInit(ok, failReason, fromReplan){
   if (ok === false){
+    if (fromReplan){
+      dynamicStart = null; replanning = false;
+      actionText('重新规划失败:' + (failReason || '未知原因'));
+      return;
+    }
     // 移动障碍可能暂时占据起点/终点格:自动重试等其移开
-    actionText(algo.failReason + ',自动重试…');
+    actionText(failReason + ',自动重试…');
     if (window.__startRetry === undefined) window.__startRetry = 0;
     if (window.__startRetry < 6){
       window.__startRetry++;
       setTimeout(() => { window.__startRetry--; if (mode === 'idle') startSearch(); }, 500);
     } else {
       window.__startRetry = 0;
-      actionText(algo.failReason + ',请移动障碍物后重试');
+      actionText(failReason + ',请移动障碍物后重试');
     }
     return;
   }
@@ -1770,16 +2043,25 @@ function autoRetrySearch(reason){
       if (dynamicStart){
         // 行驶中重规划失败:从当前位置原地重试,车继续巡航不回起点
         const oldPath = vis.path.slice();
-        algo = createAlgorithm(algId);
-        const ok = algo.init();
-        if (ok){
+        if (workerOk){
+          postWorkerStart({ algoId: algId, obstacles: world.obstacles, goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart });
           vis.path.length = 0;
           for (const p of oldPath) vis.path.push(p);
           metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
           mode = 'searching'; running = true; replanning = true;
           actionText(algo.name + ':重试中,从当前位置重新规划…');
         } else {
-          actionText('重试失败:' + (algo.failReason || '未知原因'));
+          algo = createAlgorithm(algId);
+          const ok = algo.init();
+          if (ok){
+            vis.path.length = 0;
+            for (const p of oldPath) vis.path.push(p);
+            metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
+            mode = 'searching'; running = true; replanning = true;
+            actionText(algo.name + ':重试中,从当前位置重新规划…');
+          } else {
+            actionText('重试失败:' + (algo.failReason || '未知原因'));
+          }
         }
       } else {
         startSearch();
@@ -1900,6 +2182,12 @@ function tryReplan(force){
     const changed = diffBlocked(algo.blockedBefore, after);
     if (!changed.length) return;
     algo.blockedBefore = after;
+    if (workerOk){
+      postWorkerReplanDlite(changed, after);
+      mode = 'searching'; running = true; replanning = true;
+      actionText('D* Lite:移动障碍触发增量重规划…');
+      return;
+    }
     algo.replan(changed);
     mode = 'searching'; running = true; replanning = true;
     actionText('D* Lite:移动障碍触发增量重规划…');
@@ -1908,6 +2196,16 @@ function tryReplan(force){
   // 其他算法:从车当前位置重新搜索
   const oldPath = vis.path.slice();
   dynamicStart = { x:car.x, y:car.y, theta:car.theta };
+  if (workerOk){
+    postWorkerStart({ algoId: algId, obstacles: world.obstacles, goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart });
+    // 重规划搜索期间保留上一条路径绿线,新路径算好再替换,防止闪烁
+    vis.path.length = 0;
+    for (const p of oldPath) vis.path.push(p);
+    metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
+    mode = 'searching'; running = true; replanning = true;
+    actionText(algo.name+':检测到移动障碍,重新规划路径…');
+    return;
+  }
   algo = createAlgorithm(algId);
   const ok = algo.init();
   if (ok === false){
@@ -1988,8 +2286,10 @@ function pushMetrics(){
   renderMetrics();
 }
 function abortRun(msg){
+  workerAbort();
   algo = null; mode = 'idle'; running = false;
   replanning = false; dynamicStart = null;
+  pendingBatches.length = 0;
   visReset(); dliteDirty = false; btnReplan.disabled = true;
   resetCarToStart();
   grid.buildFromWorld();
@@ -2145,7 +2445,8 @@ function doReplan(){
   const after = blockedSet();
   const changed = diffBlocked(algo.blockedBefore, after);
   algo.blockedBefore = after;
-  algo.replan(changed);
+  if (workerOk) postWorkerReplanDlite(changed, after);
+  else algo.replan(changed);
   dliteDirty = false; btnReplan.disabled = true;
   mode = 'searching'; running = true;
   actionText('D* Lite:增量重规划…');
@@ -2427,25 +2728,48 @@ function loop(t){
   const dt = Math.min(0.1, (t-lastT)/1000 || 0.016);
   lastT = t;
   if (mode === 'searching' && running && algo){
-    // 每帧步数上限(1×=80 步,探索动画清晰可见;倍速平方放大快进)
-    // 时间预算兜底:重规划 6ms 保流畅,手动搜索 15ms
-    const stepLimit = Math.max(80, 80 * speedMult * speedMult);
-    const budget = replanning ? 6 : 15;
-    const bStart = performance.now();
-    let steps = 0;
-    while (performance.now() - bStart < budget && steps < stepLimit && !algo.done){
-      handleEvents(algo.step());
-      steps++;
-    }
-    if (algo.done) afterSearchDone();
-    else if (replanning && tracker && mode === 'searching'){
-      // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
-      car.v = +speedRange.value;
-      car.delta = trackerSteer();
-      carStep(car, dt*speedMult);
-      if (vehicleCollides(car, world.obstacles)){
-        if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
-        /* 撞移动 → 重规划已在搜索中,本帧不动 */
+    if (workerOk){
+      // Worker 路径:消费渲染增量批,每帧按倍速消费;搜索在 worker 全速跑
+      const consume = Math.max(1, Math.round(speedMult));
+      let consumed = 0;
+      while (consumed < consume && pendingBatches.length){
+        applyInc(pendingBatches.shift());
+        consumed++;
+      }
+      if (algo.done){
+        while (pendingBatches.length) applyInc(pendingBatches.shift());
+        afterSearchDone();
+      } else if (replanning && tracker && mode === 'searching'){
+        // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
+        car.v = +speedRange.value;
+        car.delta = trackerSteer();
+        carStep(car, dt*speedMult);
+        if (vehicleCollides(car, world.obstacles)){
+          if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
+          /* 撞移动 → 重规划已在搜索中,本帧不动 */
+        }
+      }
+    } else {
+      // 同步路径:每帧步数上限(1×=80 步,探索动画清晰可见;倍速平方放大快进)
+      // 时间预算兜底:重规划 6ms 保流畅,手动搜索 15ms
+      const stepLimit = Math.max(80, 80 * speedMult * speedMult);
+      const budget = replanning ? 6 : 15;
+      const bStart = performance.now();
+      let steps = 0;
+      while (performance.now() - bStart < budget && steps < stepLimit && !algo.done){
+        handleEvents(algo.step());
+        steps++;
+      }
+      if (algo.done) afterSearchDone();
+      else if (replanning && tracker && mode === 'searching'){
+        // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
+        car.v = +speedRange.value;
+        car.delta = trackerSteer();
+        carStep(car, dt*speedMult);
+        if (vehicleCollides(car, world.obstacles)){
+          if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
+          /* 撞移动 → 重规划已在搜索中,本帧不动 */
+        }
       }
     }
   } else if (mode === 'following'){
@@ -2458,7 +2782,7 @@ function loop(t){
   }
   if (mode === 'searching' && algo && algo.metrics){
     metricsLive.expanded = algo.metrics.expanded;
-    metricsLive.timeMs = performance.now() - algo.t0;
+    metricsLive.timeMs = workerOk ? (algo.metrics.timeMs || 0) : (performance.now() - algo.t0);
     if (performance.now() - lastMetricsRender > 200){ lastMetricsRender = performance.now(); renderMetrics(); }
   }
   // 相机跟随(行驶/重规划巡航期间始终跟随车,避免视角跳变)
@@ -2467,7 +2791,8 @@ function loop(t){
   render();
 }
 
-/* ============ 输入 ============ */
+/* ============ 输入(仅主线程) ============ */
+if (!IS_WORKER){
 function canvasPos(e){
   const r = canvas.getBoundingClientRect();
   return { sx: e.clientX-r.left, sy: e.clientY-r.top };
@@ -2637,14 +2962,83 @@ btnResetStart.addEventListener('click', () => {
   actionText('小车已回到起点');
 });
 window.addEventListener('resize', () => { resizeCanvas(); layout(); });
+} /* end !IS_WORKER 输入区 */
 
-/* ============ 初始化 ============ */
+/* ============ Worker 入口(仅 Worker 线程) ============ */
+if (IS_WORKER){
+  let curAlgo = null, lastSamplesLen = -1;
+  function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+  function checkSamples(a){
+    if (a && a.samples && a.samples.length !== lastSamplesLen){
+      lastSamplesLen = a.samples.length;
+      vis.samples = a.samples;
+    }
+  }
+  function flushBatch(){
+    checkSamples(curAlgo);
+    const inc = vis.__drain();
+    if (!curAlgo) return;
+    postMessage({ type:'batch', inc,
+      expanded: curAlgo.metrics ? curAlgo.metrics.expanded : 0,
+      timeMs: curAlgo.t0 ? performance.now()-curAlgo.t0 : 0,
+      antsA: curAlgo.antsA ? curAlgo.antsA.map(a=>({x:a.x,y:a.y})) : null,
+      antsB: curAlgo.antsB ? curAlgo.antsB.map(a=>({x:a.x,y:a.y})) : null });
+  }
+  function workerRun(a){
+    if (curAlgo !== a) return;
+    if (a.done){
+      postMessage({ type:'done', path: a.path || [], failReason: a.failReason || '',
+        metrics: a.metrics || {}, replanRun: !!a.replanRun, hasPlan: !!a.hasPlan,
+        antsA: a.antsA ? a.antsA.map(x=>({x:x.x,y:x.y})) : null,
+        antsB: a.antsB ? a.antsB.map(x=>({x:x.x,y:x.y})) : null,
+        pheromone: a.pheromone || null });
+      return;
+    }
+    const bStart = performance.now();
+    let bSteps = 0;
+    while (!a.done && performance.now()-bStart < 20){
+      const ev = a.step();
+      if (ev) for (const e of ev) if (e.type === 'info') postMessage({ type:'info', text:e.text });
+      bSteps++;
+      if (bSteps >= 400){ flushBatch(); bSteps = 0; }
+    }
+    flushBatch();
+    setTimeout(() => workerRun(a), 0);
+  }
+  self.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.cmd === 'start'){
+      world.obstacles = msg.obstacles;
+      goal.x = msg.goal.x; goal.y = msg.goal.y;
+      start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
+      dynamicStart = msg.dynamicStart || null;
+      if (msg.seed !== undefined) Math.random = mulberry32(msg.seed);
+      lastSamplesLen = -1;
+      curAlgo = createAlgorithm(msg.algoId);
+      const ok = curAlgo.init();
+      postMessage({ type:'init', ok: ok !== false, failReason: curAlgo.failReason || '' });
+      if (ok !== false) workerRun(curAlgo);
+    } else if (msg.cmd === 'replanDlite'){
+      world.obstacles = msg.obstacles;
+      grid.buildFromWorld();
+      curAlgo.blockedBefore = msg.blockedBefore;
+      curAlgo.replan(msg.changed);
+      workerRun(curAlgo);
+    } else if (msg.cmd === 'abort'){ curAlgo = null; }
+  };
+  return;
+}
+
+/* ============ 初始化(仅主线程) ============ */
+if (!IS_WORKER){
 resizeCanvas();
 generateObstacles(0.12);
 grid.buildFromWorld();
+setupWorkers();
 updateCoverDisplay();
 layout();
 requestAnimationFrame(loop);
+}
 </script>
 </body>
 </html>
