@@ -1851,7 +1851,7 @@ function createACO(){
 
 /* ============ Worker 并行搜索(主线程侧) ============ */
 const COMPETE_IDS = new Set(['rrt','rrtstar','rrtconnect','prm','aco','apf']);
-let workerOk = false, worker1 = null, worker2 = null, pendingBatches = [];
+let workerOk = false, worker1 = null, competeWorkers = [], pendingBatches = [];
 let workerSrcCache = null;
 function mkSearchWorker(){
   try{
@@ -1873,11 +1873,7 @@ function setupWorkers(){
   worker1 = mkSearchWorker();
   if (!worker1) return;
   workerOk = true;
-  worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
-  if (COMPETE_IDS.has(algId)){
-    worker2 = mkSearchWorker();
-    if (worker2) worker2.onmessage = (e) => handleWorkerMsg(2, e.data);
-  }
+  worker1.onmessage = (e) => handleWorkerMsg(0, e.data);
 }
 function workerAlgoShadow(id){
   const def = ALGORITHMS.find(a=>a.id===id);
@@ -1899,16 +1895,18 @@ function applyInc(inc){
   }
 }
 function handleWorkerMsg(src, m){
-  if (src === 2 && m.type === 'done' && algo && !algo.done){
-    // 竞争 worker 先找到:采用其结果,终止主 worker
-    algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
-    algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
-    algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
-    if (worker1){ try{ worker1.terminate(); }catch(e){} worker1 = null; }
-    pendingBatches.length = 0;
+  if (src > 0){
+    /* 竞争 worker:只取先完成的路径 */
+    if (m.type === 'done' && algo && !algo.done){
+      algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
+      algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
+      algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
+      terminateWorkers();
+      pendingBatches.length = 0;
+    }
     return;
   }
-  if (src !== 1) return;
+  /* 主渲染 worker(src === 0) */
   if (m.type === 'init'){
     if (m.ok){
       workerReplanPending = false;
@@ -1932,8 +1930,8 @@ function handleWorkerMsg(src, m){
     return;
   }
   if (m.type === 'batch'){
-    pendingBatches.push(m.inc);
-    if (pendingBatches.length > 24) pendingBatches.splice(0, pendingBatches.length - 24);
+    /* 立即消费(消除 postMessage 背压,worker 可满载);渲染实时反映搜索进度 */
+    applyInc(m.inc);
     if (algo){
       algo.metrics.expanded = m.expanded;
       algo.metrics.timeMs = m.timeMs;
@@ -1945,11 +1943,20 @@ function handleWorkerMsg(src, m){
     algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
     algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
     algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
-    if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
+    terminateWorkers();
     pendingBatches.length = 0;
   }
 }
 let workerInitPending = false, workerReplanPending = false;
+function terminateWorkers(){
+  if (worker1){ try{ worker1.terminate(); }catch(e){} worker1 = null; }
+  for (const w of competeWorkers){ try{ w.terminate(); }catch(e){} }
+  competeWorkers = [];
+}
+function workerAbort(){
+  terminateWorkers();
+  pendingBatches.length = 0;
+}
 function postWorkerStart(params){
   if (!workerOk) return;
   pendingBatches.length = 0;
@@ -1958,15 +1965,20 @@ function postWorkerStart(params){
   workerAbort(); /* 自旋 worker 无法消息 abort:terminate 后重建 */
   worker1 = mkSearchWorker();
   if (!worker1){ workerOk = false; return; } /* Worker 异常 → 回退同步路径 */
-  worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
+  worker1.onmessage = (e) => handleWorkerMsg(0, e.data);
+  const startMsg = (seed) => ({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
+    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed, speedMult: speedMult });
+  worker1.postMessage(startMsg(1));
   if (COMPETE_IDS.has(params.algoId)){
-    worker2 = mkSearchWorker();
-    if (worker2) worker2.onmessage = (e) => handleWorkerMsg(2, e.data);
+    /* 4 worker 竞争(不同随机种子):多核并行,先完成者胜 */
+    for (let i=0;i<3;i++){
+      const w = mkSearchWorker();
+      if (!w) break;
+      w.onmessage = (e) => handleWorkerMsg(i+1, e.data);
+      w.postMessage(startMsg(i+2));
+      competeWorkers.push(w);
+    }
   }
-  worker1.postMessage({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
-    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed: 1 });
-  if (worker2) worker2.postMessage({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
-    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed: 2 });
   workerInitPending = true;
 }
 function postWorkerReplanDlite(changed, blockedAfter){
@@ -1974,17 +1986,12 @@ function postWorkerReplanDlite(changed, blockedAfter){
   if (!worker1){
     worker1 = mkSearchWorker();
     if (!worker1){ workerOk = false; return; }
-    worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
+    worker1.onmessage = (e) => handleWorkerMsg(0, e.data);
   }
   pendingBatches.length = 0;
   algo.blockedBefore = blockedAfter;
   worker1.postMessage({ cmd:'replanDlite', changed, blockedBefore: blockedAfter, obstacles: world.obstacles });
   workerReplanPending = true;
-}
-function workerAbort(){
-  if (worker1){ try{ worker1.terminate(); }catch(e){} worker1 = null; }
-  if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
-  pendingBatches.length = 0;
 }
 
 /* ============ 算法工厂 ============ */
@@ -2762,15 +2769,8 @@ function loop(t){
   lastT = t;
   if (mode === 'searching' && running && algo){
     if (workerOk){
-      // Worker 路径:消费渲染增量批,每帧按倍速消费;搜索在 worker 全速跑
-      const consume = Math.max(1, Math.round(speedMult));
-      let consumed = 0;
-      while (consumed < consume && pendingBatches.length){
-        applyInc(pendingBatches.shift());
-        consumed++;
-      }
+      /* Worker 路径:增量已在 onmessage 立即消费,此处只处理完成/巡航 */
       if (algo.done){
-        while (pendingBatches.length) applyInc(pendingBatches.shift());
         afterSearchDone();
       } else if (replanning && tracker && mode === 'searching'){
         // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
@@ -3023,9 +3023,11 @@ if (IS_WORKER){
     chk(a.treeA, 'treeA');
     chk(a.treeB, 'treeB');
   }
+  let flushCount = 0;
   function flushBatch(){
     checkSamples(curAlgo);
-    syncBig(curAlgo);
+    if (flushCount % 4 === 0) syncBig(curAlgo); /* 大数组同步节流,减克隆开销 */
+    flushCount++;
     const inc = vis.__drain();
     if (!curAlgo) return;
     postMessage({ type:'batch', inc,
@@ -3036,17 +3038,18 @@ if (IS_WORKER){
   }
   function workerRun(a, deadloop){
     if (curAlgo !== a) return;
+    const budgetMs = a._budgetMs || 20;
     let tickCount = 0;
-    /* 死循环满载:持续 20ms 预算块全速计算,不依赖 setTimeout(后台节流免疫);
+    /* 死循环满载:持续预算块全速计算,不依赖 setTimeout(后台节流免疫);
        D* Lite 需处理增量重规划消息 → 周期让出 */
     while (!a.done){
       const bStart = performance.now();
       let bSteps = 0;
-      while (!a.done && performance.now()-bStart < 20){
+      while (!a.done && performance.now()-bStart < budgetMs){
         const ev = a.step();
         if (ev) for (const e of ev) if (e.type === 'info') postMessage({ type:'info', text:e.text });
         bSteps++;
-        if (bSteps >= 400){ flushBatch(); bSteps = 0; }
+        if (bSteps >= 2000){ flushBatch(); bSteps = 0; }
       }
       flushBatch();
       tickCount++;
@@ -3066,8 +3069,9 @@ if (IS_WORKER){
       start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
       dynamicStart = msg.dynamicStart || null;
       if (msg.seed !== undefined) Math.random = mulberry32(msg.seed);
-      lastSamplesLen = -1;
       curAlgo = createAlgorithm(msg.algoId);
+      curAlgo._budgetMs = 20 * (msg.speedMult || 1);
+      lastSamplesLen = -1;
       const ok = curAlgo.init();
       postMessage({ type:'init', ok: ok !== false, failReason: curAlgo.failReason || '' });
       if (ok !== false) workerRun(curAlgo, curAlgo.id !== 'dlite');
