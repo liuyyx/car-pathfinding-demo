@@ -1887,8 +1887,9 @@ function applyInc(inc){
     if (t==='ms'){ const n=it[1],k=it[2],v=it[3]; if (vis[n] && vis[n].set) vis[n].set(k,v); }
     else if (t==='md'){ const n=it[1],k=it[2]; if (vis[n] && vis[n].delete) vis[n].delete(k); }
     else if (t==='mc'){ const n=it[1]; if (vis[n] && vis[n].clear) vis[n].clear(); }
-    else if (t==='ap'){ const n=it[1],v=it[2]; if (vis[n] && vis[n].push) vis[n].push(v); }
-    else if (t==='al'){ const n=it[1],len=it[2]; if (vis[n]) vis[n].length = len; }
+    else if (t==='ap'){ const n=it[1],v=it[2]; if (n !== 'path' && vis[n] && vis[n].push) vis[n].push(v); }
+    /* path 由主线程管理(重规划保留旧绿线、完成后替换),忽略 worker 的 path 增量防闪烁 */
+    else if (t==='al'){ const n=it[1],len=it[2]; if (n !== 'path' && vis[n]) vis[n].length = len; }
     else if (t==='cur'){ vis.current = it[1]; }
     else if (t==='force'){ vis.force = it[1]; }
     else if (t==='samples'){ vis.samples = it[1]; }
