@@ -2230,9 +2230,11 @@ function tryReplan(force){
     actionText('D* Lite:移动障碍触发增量重规划…');
     return;
   }
-  // 其他算法:从车当前位置重新搜索
+  // 其他算法:从车当前位置重新搜索(起点吸附最近自由格,防车贴障碍时起点被占)
   const oldPath = vis.path.slice();
-  dynamicStart = { x:car.x, y:car.y, theta:car.theta };
+  grid.buildFromWorld();
+  const sc = nearestFreeCell(car.x, car.y);
+  dynamicStart = { x: sc.x*GRID+GRID/2, y: sc.y*GRID+GRID/2, theta: car.theta };
   if (workerOk){
     postWorkerStart({ algoId: algId, obstacles: world.obstacles, goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart });
     workerInitPending = false; workerReplanPending = true; /* 重规划:init 回执不重复设模式 */
@@ -3068,6 +3070,11 @@ if (IS_WORKER){
       goal.x = msg.goal.x; goal.y = msg.goal.y;
       start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
       dynamicStart = msg.dynamicStart || null;
+      if (dynamicStart){
+        /* 起点吸附最近自由格:防车贴障碍时重规划起点被膨胀覆盖 */
+        const sc2 = nearestFreeCell(dynamicStart.x, dynamicStart.y);
+        dynamicStart = { x: sc2.x*GRID+GRID/2, y: sc2.y*GRID+GRID/2, theta: dynamicStart.theta || 0 };
+      }
       if (msg.seed !== undefined) Math.random = mulberry32(msg.seed);
       curAlgo = createAlgorithm(msg.algoId);
       curAlgo._budgetMs = 20 * (msg.speedMult || 1);
