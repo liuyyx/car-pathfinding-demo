@@ -305,8 +305,8 @@ function buildObstacleBuckets(){
   const bw = Math.ceil(W/BUCKET), bh = Math.ceil(H/BUCKET);
   for (let i=0;i<world.obstacles.length;i++){
     const o = world.obstacles[i];
-    const bx0 = Math.max(0, Math.floor((o.x-12)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((o.x+o.w+12)/BUCKET));
-    const by0 = Math.max(0, Math.floor((o.y-12)/BUCKET)), by1 = Math.min(bh-1, Math.floor((o.y+o.h+12)/BUCKET));
+    const bx0 = Math.max(0, Math.floor((o.x-20)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((o.x+o.w+20)/BUCKET));
+    const by0 = Math.max(0, Math.floor((o.y-20)/BUCKET)), by1 = Math.min(bh-1, Math.floor((o.y+o.h+20)/BUCKET));
     for (let by=by0;by<=by1;by++) for (let bx=bx0;bx<=bx1;bx++){
       const k = by*bw+bx;
       let arr = obsBuckets.get(k);
@@ -319,7 +319,7 @@ function probeCollides(x,y,theta){
   if (!obsBuckets){
     for (const o of world.obstacles){
       // 混合 A* 轨迹为弧线段,折角处跟随会切角;碰撞检查加 12px 膨胀补偿
-      if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+      if (obbRectHit(x,y,theta,{ x:o.x-18, y:o.y-18, w:o.w+36, h:o.h+36 },HIT_L,HIT_W)) return true;
     }
     return false;
   }
@@ -335,7 +335,7 @@ function probeCollides(x,y,theta){
       if (seen.indexOf(oi) >= 0) continue;
       seen.push(oi);
       const o = world.obstacles[oi];
-      if (obbRectHit(x,y,theta,{ x:o.x-12, y:o.y-12, w:o.w+24, h:o.h+24 },HIT_L,HIT_W)) return true;
+      if (obbRectHit(x,y,theta,{ x:o.x-18, y:o.y-18, w:o.w+36, h:o.h+36 },HIT_L,HIT_W)) return true;
     }
   }
   return false;
@@ -1852,12 +1852,21 @@ function createACO(){
 /* ============ Worker 并行搜索(主线程侧) ============ */
 const COMPETE_IDS = new Set(['rrt','rrtstar','rrtconnect','prm','aco','apf']);
 let workerOk = false, worker1 = null, worker2 = null, pendingBatches = [];
+let workerSrcCache = null;
 function mkSearchWorker(){
   try{
     if (typeof Worker === 'undefined' || typeof URL === 'undefined' || typeof Blob === 'undefined') return null;
-    const src = document.currentScript ? document.currentScript.textContent : '';
-    if (!src) return null;
-    return new Worker(URL.createObjectURL(new Blob([src], { type:'text/javascript' })));
+    if (!workerSrcCache){
+      const cs = document.currentScript;
+      workerSrcCache = cs ? cs.textContent : '';
+      if (!workerSrcCache){
+        // 事件回调里 currentScript 为 null:回退取最后一个内联 script
+        const ss = document.querySelectorAll('script');
+        workerSrcCache = ss.length ? ss[ss.length-1].textContent : '';
+      }
+    }
+    if (!workerSrcCache) return null;
+    return new Worker(URL.createObjectURL(new Blob([workerSrcCache], { type:'text/javascript' })));
   }catch(err){ return null; }
 }
 function setupWorkers(){
@@ -1895,22 +1904,33 @@ function handleWorkerMsg(src, m){
     algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
     algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
     algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
-    if (worker1) worker1.postMessage({ cmd:'abort' });
+    if (worker1){ try{ worker1.terminate(); }catch(e){} worker1 = null; }
     pendingBatches.length = 0;
     return;
   }
   if (src !== 1) return;
   if (m.type === 'init'){
-    workerInitPending = false;
     if (m.ok){
       workerReplanPending = false;
       if (algo && algo.id === 'dlite') algo.blockedBefore = blockedSet();
+      if (workerInitPending){
+        workerInitPending = false;
+        afterAlgoInit(true, ''); /* 手动搜索:正式进入 searching 模式,驱动动画消费 */
+      }
+      /* 重规划:mode 已由 tryReplan 设置,无需重复 */
     } else {
-      afterAlgoInit(false, m.failReason || '初始化失败');
+      const fromReplan = workerReplanPending;
+      workerInitPending = false; workerReplanPending = false;
+      afterAlgoInit(false, m.failReason || '初始化失败', fromReplan);
     }
     return;
   }
   if (m.type === 'info'){ actionText(m.text); return; }
+  if (m.type === 'big'){
+    if (algo) algo[m.name] = m.data;
+    if (m.name === 'samples') vis.samples = m.data;
+    return;
+  }
   if (m.type === 'batch'){
     pendingBatches.push(m.inc);
     if (pendingBatches.length > 24) pendingBatches.splice(0, pendingBatches.length - 24);
@@ -1925,17 +1945,20 @@ function handleWorkerMsg(src, m){
     algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
     algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
     algo.antsA = m.antsA; algo.antsB = m.antsB; if (m.pheromone) algo.pheromone = m.pheromone;
-    if (worker2) worker2.postMessage({ cmd:'abort' });
+    if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
     pendingBatches.length = 0;
   }
 }
 let workerInitPending = false, workerReplanPending = false;
 function postWorkerStart(params){
-  if (!workerOk || !worker1) return;
+  if (!workerOk) return;
   pendingBatches.length = 0;
   algo = workerAlgoShadow(params.algoId);
   algo.blockedBefore = null;
-  if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
+  workerAbort(); /* 自旋 worker 无法消息 abort:terminate 后重建 */
+  worker1 = mkSearchWorker();
+  if (!worker1){ workerOk = false; return; } /* Worker 异常 → 回退同步路径 */
+  worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
   if (COMPETE_IDS.has(params.algoId)){
     worker2 = mkSearchWorker();
     if (worker2) worker2.onmessage = (e) => handleWorkerMsg(2, e.data);
@@ -1947,15 +1970,21 @@ function postWorkerStart(params){
   workerInitPending = true;
 }
 function postWorkerReplanDlite(changed, blockedAfter){
-  if (!workerOk || !worker1 || !algo) return;
+  if (!workerOk) return;
+  if (!worker1){
+    worker1 = mkSearchWorker();
+    if (!worker1){ workerOk = false; return; }
+    worker1.onmessage = (e) => handleWorkerMsg(1, e.data);
+  }
   pendingBatches.length = 0;
   algo.blockedBefore = blockedAfter;
   worker1.postMessage({ cmd:'replanDlite', changed, blockedBefore: blockedAfter, obstacles: world.obstacles });
   workerReplanPending = true;
 }
 function workerAbort(){
-  if (worker1) try{ worker1.postMessage({ cmd:'abort' }); }catch(e){}
-  if (worker2) try{ worker2.postMessage({ cmd:'abort' }); }catch(e){}
+  if (worker1){ try{ worker1.terminate(); }catch(e){} worker1 = null; }
+  if (worker2){ try{ worker2.terminate(); }catch(e){} worker2 = null; }
+  pendingBatches.length = 0;
 }
 
 /* ============ 算法工厂 ============ */
@@ -2045,6 +2074,7 @@ function autoRetrySearch(reason){
         const oldPath = vis.path.slice();
         if (workerOk){
           postWorkerStart({ algoId: algId, obstacles: world.obstacles, goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart });
+          workerInitPending = false; workerReplanPending = true;
           vis.path.length = 0;
           for (const p of oldPath) vis.path.push(p);
           metricsLive = { alg:algo.name, pathLen:0, expanded:0, timeMs:0, collisions:0 };
@@ -2198,6 +2228,7 @@ function tryReplan(force){
   dynamicStart = { x:car.x, y:car.y, theta:car.theta };
   if (workerOk){
     postWorkerStart({ algoId: algId, obstacles: world.obstacles, goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart });
+    workerInitPending = false; workerReplanPending = true; /* 重规划:init 回执不重复设模式 */
     // 重规划搜索期间保留上一条路径绿线,新路径算好再替换,防止闪烁
     vis.path.length = 0;
     for (const p of oldPath) vis.path.push(p);
@@ -2514,22 +2545,23 @@ function drawAlgoLayers(ctx, view){
     ctx.stroke(); ctx.globalAlpha = 1;
   }
   // PRM / 可见性图 边
-  if (algo && (algo.id === 'prm' || algo.id === 'vgraph') && algo.edges.length){
+  if (algo && (algo.id === 'prm' || algo.id === 'vgraph') && algo.edges && algo.samples && algo.edges.length){
     ctx.strokeStyle = '#aab2bd'; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
     ctx.beginPath();
     for (const ed of algo.edges){
       const pa = algo.samples[ed[0]], pb = algo.samples[ed[1]];
+      if (!pa || !pb) continue;
       if (!rectInView(Math.min(pa.x,pb.x), Math.min(pa.y,pb.y), Math.abs(pb.x-pa.x)+1, Math.abs(pb.y-pa.y)+1, view)) continue;
       ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y);
     }
     ctx.stroke(); ctx.globalAlpha = 1;
   }
   // RRT 树
-  if (algo && (algo.id === 'rrt' || algo.id === 'rrtstar') && algo.nodes){
+  if (algo && (algo.id === 'rrt' || algo.id === 'rrtstar') && algo.nodes && algo.edges){
     ctx.lineWidth = 1.2;
     for (const ed of algo.edges){
       const na = algo.nodes[ed.a], nb = algo.nodes[ed.b];
-      if (!rectInView(Math.min(na.x,nb.x), Math.min(na.y,nb.y), Math.abs(nb.x-na.x)+1, Math.abs(nb.y-na.y)+1, view)) continue;
+      if (!na || !nb) continue;
       ctx.strokeStyle = ed.kind === 'rewire' ? c.rewire : c.tree;
       ctx.beginPath(); ctx.moveTo(na.x,na.y); ctx.lineTo(nb.x,nb.y); ctx.stroke();
     }
@@ -2540,12 +2572,13 @@ function drawAlgoLayers(ctx, view){
     }
   }
   // RRT-Connect 双树(树A 蓝灰 / 树B 橙 / 连接绿)
-  if (algo && algo.id === 'rrtconnect'){
+  if (algo && algo.id === 'rrtconnect' && algo.edges && algo.treeA && algo.treeB){
     ctx.lineWidth = 1.2;
     for (const ed of algo.edges){
       let na, nb;
       if (ed.tree === 'conn'){ na = algo.treeA[ed.a]; nb = algo.treeB[ed.b]; }
       else { const t = ed.tree === 'A' ? algo.treeA : algo.treeB; na = t[ed.a]; nb = t[ed.b]; }
+      if (!na || !nb) continue;
       if (!rectInView(Math.min(na.x,nb.x), Math.min(na.y,nb.y), Math.abs(nb.x-na.x)+1, Math.abs(nb.y-na.y)+1, view)) continue;
       ctx.strokeStyle = ed.tree === 'conn' ? c.path : (ed.tree === 'A' ? c.tree : '#f0a35e');
       ctx.beginPath(); ctx.moveTo(na.x,na.y); ctx.lineTo(nb.x,nb.y); ctx.stroke();
@@ -2974,8 +3007,25 @@ if (IS_WORKER){
       vis.samples = a.samples;
     }
   }
+  /* 渲染用大数组(edges/nodes/treeA/treeB/samples)长度变化时全量回传 */
+  const lastBigLen = {};
+  function syncBig(a){
+    if (!a) return;
+    const chk = (arr, name) => {
+      if (arr && arr.length !== lastBigLen[name]){
+        lastBigLen[name] = arr.length;
+        postMessage({ type:'big', name, data: arr });
+      }
+    };
+    chk(a.samples, 'samples');
+    chk(a.edges, 'edges');
+    chk(a.nodes, 'nodes');
+    chk(a.treeA, 'treeA');
+    chk(a.treeB, 'treeB');
+  }
   function flushBatch(){
     checkSamples(curAlgo);
+    syncBig(curAlgo);
     const inc = vis.__drain();
     if (!curAlgo) return;
     postMessage({ type:'batch', inc,
@@ -2984,26 +3034,29 @@ if (IS_WORKER){
       antsA: curAlgo.antsA ? curAlgo.antsA.map(a=>({x:a.x,y:a.y})) : null,
       antsB: curAlgo.antsB ? curAlgo.antsB.map(a=>({x:a.x,y:a.y})) : null });
   }
-  function workerRun(a){
+  function workerRun(a, deadloop){
     if (curAlgo !== a) return;
-    if (a.done){
-      postMessage({ type:'done', path: a.path || [], failReason: a.failReason || '',
-        metrics: a.metrics || {}, replanRun: !!a.replanRun, hasPlan: !!a.hasPlan,
-        antsA: a.antsA ? a.antsA.map(x=>({x:x.x,y:x.y})) : null,
-        antsB: a.antsB ? a.antsB.map(x=>({x:x.x,y:x.y})) : null,
-        pheromone: a.pheromone || null });
-      return;
+    let tickCount = 0;
+    /* 死循环满载:持续 20ms 预算块全速计算,不依赖 setTimeout(后台节流免疫);
+       D* Lite 需处理增量重规划消息 → 周期让出 */
+    while (!a.done){
+      const bStart = performance.now();
+      let bSteps = 0;
+      while (!a.done && performance.now()-bStart < 20){
+        const ev = a.step();
+        if (ev) for (const e of ev) if (e.type === 'info') postMessage({ type:'info', text:e.text });
+        bSteps++;
+        if (bSteps >= 400){ flushBatch(); bSteps = 0; }
+      }
+      flushBatch();
+      tickCount++;
+      if (!deadloop && tickCount % 30 === 0){ setTimeout(() => workerRun(a, deadloop), 0); return; }
     }
-    const bStart = performance.now();
-    let bSteps = 0;
-    while (!a.done && performance.now()-bStart < 20){
-      const ev = a.step();
-      if (ev) for (const e of ev) if (e.type === 'info') postMessage({ type:'info', text:e.text });
-      bSteps++;
-      if (bSteps >= 400){ flushBatch(); bSteps = 0; }
-    }
-    flushBatch();
-    setTimeout(() => workerRun(a), 0);
+    postMessage({ type:'done', path: a.path || [], failReason: a.failReason || '',
+      metrics: a.metrics || {}, replanRun: !!a.replanRun, hasPlan: !!a.hasPlan,
+      antsA: a.antsA ? a.antsA.map(x=>({x:x.x,y:x.y})) : null,
+      antsB: a.antsB ? a.antsB.map(x=>({x:x.x,y:x.y})) : null,
+      pheromone: a.pheromone || null });
   }
   self.onmessage = (e) => {
     const msg = e.data;
@@ -3017,16 +3070,16 @@ if (IS_WORKER){
       curAlgo = createAlgorithm(msg.algoId);
       const ok = curAlgo.init();
       postMessage({ type:'init', ok: ok !== false, failReason: curAlgo.failReason || '' });
-      if (ok !== false) workerRun(curAlgo);
+      if (ok !== false) workerRun(curAlgo, curAlgo.id !== 'dlite');
     } else if (msg.cmd === 'replanDlite'){
       world.obstacles = msg.obstacles;
       grid.buildFromWorld();
       curAlgo.blockedBefore = msg.blockedBefore;
       curAlgo.replan(msg.changed);
-      workerRun(curAlgo);
+      workerRun(curAlgo, false);
     } else if (msg.cmd === 'abort'){ curAlgo = null; }
   };
-  return;
+  /* 注意:这里不能写顶层 return(浏览器 <script> 非法),靠下面的 if(!IS_WORKER) 隔离主线程代码 */
 }
 
 /* ============ 初始化(仅主线程) ============ */
