@@ -2389,6 +2389,7 @@ function updateMovingObstacles(dt){
   const sp = +moveSpeedRange.value;
   if (sp <= 0) return;
   const carRect = carClearRect();
+  /* 圆形保护区(消除正方形对角线漏洞:正方形角向可漏进 24px 膨胀内) */
   const goalRect = { x: goal.x - GOAL_CLEAR, y: goal.y - GOAL_CLEAR, w: GOAL_CLEAR*2, h: GOAL_CLEAR*2 };
   const startRect = { x: start.x - START_R, y: start.y - START_R, w: START_R*2, h: START_R*2 };
   // 空间桶:大障碍数量下避免全对碰撞检查
@@ -2427,8 +2428,8 @@ function updateMovingObstacles(dt){
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
         let clear = !blockedByOthers(nx, ny, o.w, o.h, o);
         if (clear && aabbHit(nrect, carRect)) clear = false;
-        if (clear && aabbHit(nrect, goalRect)) clear = false;
-        if (clear && aabbHit(nrect, startRect)) clear = false;
+        if (clear && circleRectHit(goal.x, goal.y, GOAL_CLEAR, nrect)) clear = false;
+        if (clear && circleRectHit(start.x, start.y, START_R, nrect)) clear = false;
         if (clear && nx >= 0 && nx+o.w <= W && ny >= 0 && ny+o.h <= H){ o.x = nx; o.y = ny; }
       }
       continue;
@@ -2464,8 +2465,8 @@ function updateMovingObstacles(dt){
         const nrect = { x:nx, y:ny, w:o.w, h:o.h };
         let clear = !blockedByOthers(nx, ny, o.w, o.h, o);
         if (clear && aabbHit(nrect, carRect)) clear = false;
-        if (clear && aabbHit(nrect, goalRect)) clear = false;
-        if (clear && aabbHit(nrect, startRect)) clear = false;
+        if (clear && circleRectHit(goal.x, goal.y, GOAL_CLEAR, nrect)) clear = false;
+        if (clear && circleRectHit(start.x, start.y, START_R, nrect)) clear = false;
         if (clear){
           o.x = nx; o.y = ny;
           o.vel.vx = vx; o.vel.vy = vy;
@@ -3070,6 +3071,7 @@ if (IS_WORKER){
       world.obstacles = msg.obstacles;
       goal.x = msg.goal.x; goal.y = msg.goal.y;
       start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
+      grid.buildFromWorld(); /* 吸附与算法 init 都依赖网格 */
       dynamicStart = msg.dynamicStart || null;
       if (dynamicStart){
         /* 起点吸附最近自由格:防车贴障碍时重规划起点被膨胀覆盖 */
