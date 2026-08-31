@@ -1502,14 +1502,19 @@ function createACO(){
       this.startC = grid.cellAt(algoStart().x, algoStart().y);
       this.goalC = grid.cellAt(goal.x, goal.y);
       if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
-      this.ANT_N = 16; this.ANT_MAX = 900; this.MAX_ITER = 80;
-      this.ALPHA = 1; this.BETA = 3; this.RHO = 0.12; this.Q = 100;
+      this.ANT_N = 16; this.ANT_MAX = 500; this.MAX_ITER = 120;
+      this.ALPHA = 1; this.BETA = 3; this.RHO = 0.06; this.Q = 100;
       // A 群(朝终点)偏贪心推进;B 群(朝起点)偏随机扩散覆盖,两群相遇合并
-      this.GREEDY_A = 0.7; this.GREEDY_B = 0.3;
+      this.GREEDY_A = 0.65; this.GREEDY_B = 0.25;
+      this.STAGNANT_LIMIT = 100; // 连续 100 步距离无改善 → 放弃(允许绕大障碍)
+      this.NO_IMPROVE_LIMIT = 30; // 连续 30 轮最优无改进 → 提前收敛
+      this.ELITE = 0.25; // 精英强化系数(弱化,避免锁定次优路径)
       this.retriesLeft = 3; // 失败自动重置信息素重试
       this.tau = new Float32Array(grid.cols*grid.rows);
       for (let i=0;i<this.tau.length;i++) this.tau[i] = 0.1;
-      this.iter = 0; this.bestLen = Infinity; this.bestPath = [];
+      this.iter = 0; this.noImprove = 0;
+      this.bestLen = Infinity; this.bestPath = [];
+      this.warmup();
       this.t0 = performance.now();
       this.spawnAnts();
       visReset();
@@ -1518,12 +1523,29 @@ function createACO(){
       return true;
     },
     idx(c){ return c.y*grid.cols + c.x; },
+    warmup(){
+      /* A* 预热:跑一次网格搜索建立信息素走廊,保证基础路径质量,
+         蚂蚁沿走廊行走并探索改进(避免贪心被障碍卡死导致失败) */
+      const gs = createGridSearch('astar');
+      if (gs.init() !== false){
+        let guard = 0;
+        while (!gs.done && guard++ < 200000) gs.step();
+        if (gs.path && gs.path.length >= 2){
+          this.bestLen = pathLen(gs.path);
+          this.bestPath = gs.path.map(p => grid.cellAt(p.x, p.y));
+          for (const p of gs.path){
+            const c = grid.cellAt(p.x, p.y);
+            this.tau[this.idx(c)] = 0.6;
+          }
+        }
+      }
+    },
     spawnAnts(){
       this.antsA = []; this.antsB = [];
       this.visitedB = new Set(); this.cellOwnerB = new Map();
       for (let i=0;i<this.ANT_N;i++){
-        this.antsA.push({ x:this.startC.x, y:this.startC.y, path:[this.startC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_A });
-        this.antsB.push({ x:this.goalC.x, y:this.goalC.y, path:[this.goalC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_B });
+        this.antsA.push({ x:this.startC.x, y:this.startC.y, path:[this.startC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_A, lastD: Math.hypot(this.startC.x-this.goalC.x, this.startC.y-this.goalC.y), stagnant:0 });
+        this.antsB.push({ x:this.goalC.x, y:this.goalC.y, path:[this.goalC], steps:0, done:false, greedy: i<3 ? 1 : this.GREEDY_B, lastD: Math.hypot(this.goalC.x-this.startC.x, this.goalC.y-this.startC.y), stagnant:0 });
       }
       this.visitedB.add(ck(this.goalC));
       this.cellOwnerB.set(ck(this.goalC), { ant:this.antsB[0], idx:0 });
@@ -1573,6 +1595,11 @@ function createACO(){
           if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
           this.moveAnt(ant, this.goalC, false);
           if (ant.done) break;
+          // 停滞检测:连续多步距终点距离无改善 → 死路放弃,避免拖慢整轮
+          const d = Math.hypot(ant.x-this.goalC.x, ant.y-this.goalC.y);
+          if (d >= ant.lastD){ ant.stagnant++; } else { ant.stagnant = 0; }
+          ant.lastD = d;
+          if (ant.stagnant > this.STAGNANT_LIMIT){ ant.done = true; break; }
           const dg = Math.max(Math.abs(ant.x-this.goalC.x), Math.abs(ant.y-this.goalC.y));
           if (dg <= 2){
             if (dg > 0){ ant.path.push(this.goalC); }
@@ -1604,6 +1631,11 @@ function createACO(){
           if (ant.steps > this.ANT_MAX){ ant.done = true; break; }
           this.moveAnt(ant, this.startC, true);
           if (ant.done) break;
+          // 停滞检测
+          const d = Math.hypot(ant.x-this.startC.x, ant.y-this.startC.y);
+          if (d >= ant.lastD){ ant.stagnant++; } else { ant.stagnant = 0; }
+          ant.lastD = d;
+          if (ant.stagnant > this.STAGNANT_LIMIT){ ant.done = true; break; }
           const ds = Math.max(Math.abs(ant.x-this.startC.x), Math.abs(ant.y-this.startC.y));
           if (ds <= 2){
             if (ds > 0){ ant.path.push(this.startC); }
@@ -1616,6 +1648,7 @@ function createACO(){
         }
       }
       if (!anyActive){
+        const prevBest = this.bestLen;
         for (let i=0;i<this.tau.length;i++) this.tau[i] *= (1-this.RHO);
         for (const p of this.reachedPaths){
           const L = pathLen(p.map(grid.cellCenter));
@@ -1623,15 +1656,24 @@ function createACO(){
           const dTau = this.Q / L;
           for (let i=0;i<p.length-1;i++) this.tau[this.idx(p[i])] += dTau;
         }
+        // 精英强化:全局最优路径额外加强,加速收敛(弱系数防锁死次优)
+        if (this.bestPath.length){
+          const dT = this.Q / this.bestLen;
+          for (let i=0;i<this.bestPath.length-1;i++) this.tau[this.idx(this.bestPath[i])] += dT * this.ELITE;
+        }
         this.iter++;
         this.metrics.expanded = this.iter * this.ANT_N * 2;
         this.metrics.timeMs = performance.now()-this.t0;
-        if (this.iter >= this.MAX_ITER){
+        if (this.bestLen < prevBest) this.noImprove = 0;
+        else this.noImprove++;
+        if (this.noImprove >= this.NO_IMPROVE_LIMIT || this.iter >= this.MAX_ITER){
           if (!this.bestPath.length && this.retriesLeft > 0){
-            // 自动重试:重置信息素与迭代计数
+            // 自动重试:重置信息素并重新 A* 预热
             this.retriesLeft--;
             for (let i=0;i<this.tau.length;i++) this.tau[i] = 0.1;
-            this.iter = 0; this.bestLen = Infinity; this.bestPath = [];
+            this.iter = 0; this.noImprove = 0;
+            this.bestLen = Infinity; this.bestPath = [];
+            this.warmup();
             this.spawnAnts();
             events.push({ type:'info', text:'蚁群:未收敛,重置信息素重试(剩余 '+this.retriesLeft+' 次)' });
             return events;
