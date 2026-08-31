@@ -1502,18 +1502,34 @@ function createRRTConnect(){
 }
 
 /* ============ 可见性图 ============ */
-function segmentFreeInfl(a,b){
+function segmentFreeInfl(a,b,obsBuckets){
   const minx = Math.min(a.x,b.x), maxx = Math.max(a.x,b.x);
   const miny = Math.min(a.y,b.y), maxy = Math.max(a.y,b.y);
-  // bbox 粗筛:只对线段包围盒相交的障碍做膨胀采样检查
   const nearby = [];
-  for (const o of world.obstacles){
-    if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
-    nearby.push(inflated(o, CLEAR));
+  if (obsBuckets){
+    /* 空间桶:线段 bbox(含膨胀)覆盖的桶内障碍,免全障碍遍历 */
+    const bw = Math.ceil(W/BUCKET);
+    const bx0 = Math.max(0, Math.floor((minx-CLEAR)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((maxx+CLEAR)/BUCKET));
+    const by0 = Math.max(0, Math.floor((miny-CLEAR)/BUCKET)), by1 = Math.min(Math.ceil(H/BUCKET)-1, Math.floor((maxy+CLEAR)/BUCKET));
+    for (let by=by0;by<=by1;by++) for (let bx=bx0;bx<=bx1;bx++){
+      const arr = obsBuckets.get(by*bw+bx);
+      if (!arr) continue;
+      for (const oi of arr){
+        const o = world.obstacles[oi];
+        if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
+        nearby.push(inflated(o, CLEAR));
+      }
+    }
+  } else {
+    for (const o of world.obstacles){
+      if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
+      nearby.push(inflated(o, CLEAR));
+    }
   }
   if (nearby.length === 0) return true;
   const d = Math.hypot(b.x-a.x, b.y-a.y);
-  const n = Math.max(1, Math.ceil(d/6));
+  /* 采样步长 12px(膨胀 24px 的一半):斜穿窄矩形也不漏检,比原 6px 快一倍 */
+  const n = Math.max(1, Math.ceil(d/12));
   for (let i=0;i<=n;i++){
     const t = i/n;
     const px = a.x+(b.x-a.x)*t, py = a.y+(b.y-a.y)*t;
@@ -1546,6 +1562,17 @@ function createVGraph(){
       this.adj = this.nodes.map(() => new Set());
       this.edges = [];
       this.samples = this.nodes;
+      buildObstacleBuckets(); /* 线段可见性检查空间桶 */
+      /* 节点空间桶:免全对距离排序找近邻 */
+      this.NB = 300;
+      this.nodeB = new Map();
+      for (let i=0;i<this.nodes.length;i++){
+        const n = this.nodes[i];
+        const k = Math.floor(n.x/this.NB)+','+Math.floor(n.y/this.NB);
+        let arr = this.nodeB.get(k);
+        if (!arr){ arr = []; this.nodeB.set(k, arr); }
+        arr.push(i);
+      }
       this.phase = 'build'; this.si = 0; this.pops = 0;
       this.t0 = performance.now();
       visReset();
@@ -1555,15 +1582,24 @@ function createVGraph(){
     step(){
       const events = [];
       if (this.phase === 'build'){
-        for (let k2=0; k2<4 && this.si < this.nodes.length; k2++){
+        for (let k2=0; k2<8 && this.si < this.nodes.length; k2++){
         const si = this.si;
         const p = this.nodes[si];
-        // 大图下不全对连线:按距离取 k=20 近邻尝试(含 bbox 粗筛的线段检查)
+        /* 桶近邻:从 p 周围桶收集候选(免全对排序),半径逐圈扩展 */
         const order = [];
-        for (let j=0;j<this.nodes.length;j++){
-          if (j === si || this.adj[si].has(j)) continue;
-          const dx = p.x-this.nodes[j].x, dy = p.y-this.nodes[j].y;
-          order.push([j, dx*dx+dy*dy]);
+        for (let rad=0; rad<6 && order.length < 60; rad++){
+          const x0 = Math.floor((p.x-rad*this.NB)/this.NB), x1 = Math.floor((p.x+rad*this.NB)/this.NB);
+          const y0 = Math.floor((p.y-rad*this.NB)/this.NB), y1 = Math.floor((p.y+rad*this.NB)/this.NB);
+          for (let by=y0;by<=y1;by++) for (let bx=x0;bx<=x1;bx++){
+            const arr = this.nodeB.get(bx+','+by);
+            if (!arr) continue;
+            for (const j of arr){
+              if (j === si) continue;
+              const dx = p.x-this.nodes[j].x, dy = p.y-this.nodes[j].y;
+              order.push([j, dx*dx+dy*dy]);
+            }
+          }
+          if (order.length >= 60) break;
         }
         order.sort((a,b)=>a[1]-b[1]);
         const kLimit = (si === this.startIdx || si === this.goalIdx) ? 40 : 20;
@@ -1571,7 +1607,7 @@ function createVGraph(){
         for (let t2=0;t2<order.length && added<kLimit;t2++){
           const j = order[t2][0];
           if (this.adj[si].has(j)) continue;
-          if (segmentFreeInfl(p, this.nodes[j])){
+          if (segmentFreeInfl(p, this.nodes[j], obsBuckets)){
             this.adj[si].add(j); this.adj[j].add(si);
             this.edges.push([si, j]);
             added++;
