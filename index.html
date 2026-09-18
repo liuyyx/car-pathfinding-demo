@@ -5,86 +5,247 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>小车寻路算法演示</title>
 <style>
+  /* ============ 设计令牌(深色测控台) ============ */
+  :root{
+    color-scheme: dark;
+    --bg:#0b0e13;            /* 页面底(世界之外) */
+    --panel:rgba(22,27,36,.86); /* 玻璃面板 */
+    --panel-solid:#161b24;
+    --panel-2:#1c232f;       /* 控件抬起面 */
+    --panel-3:#232b39;       /* hover 面 */
+    --border:#2a3342;
+    --border-soft:#222a37;
+    --text:#dde5ee;
+    --text-2:#9fadc2;
+    --text-3:#77869c;
+    --accent:#f5b53f;        /* 琥珀:全场唯一暖色强调(状态点/焦点/激活) */
+    --run:#3b8cf5;           /* 主行动(青蓝) */
+    --run-hi:#5aa2ff;
+    --mono:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;
+    --r-panel:14px; --r-ctl:8px;
+  }
   * { margin:0; padding:0; box-sizing:border-box; }
-  html,body { width:100%; height:100%; overflow:hidden; background:#e8eaee; }
-  body { font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; font-size:13px; color:#2b2f36; user-select:none; }
-  #toolbar { position:fixed; top:0; left:0; right:0; z-index:10; background:#fff; border-bottom:1px solid #d0d4da;
-    padding:6px 12px; display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; box-shadow:0 1px 3px rgba(0,0,0,.04); }
-  .grp { display:flex; align-items:center; gap:4px; white-space:nowrap; }
-  .grp-label { color:#6b7280; margin-right:2px; }
-  select, button { font:inherit; color:#2b2f36; background:#fff; border:1px solid #d0d4da; border-radius:6px; padding:3px 9px; cursor:pointer; }
-  button:hover:not(:disabled) { background:#f3f5f8; }
-  button:disabled { opacity:.45; cursor:default; }
-  button.primary { background:#2f6fd8; border-color:#2f6fd8; color:#fff; }
-  button.primary:hover:not(:disabled) { background:#2559b0; }
-  input[type=range] { width:90px; accent-color:#2f6fd8; }
-  input[type=radio], input[type=checkbox] { accent-color:#2f6fd8; }
-  label { display:inline-flex; align-items:center; gap:2px; cursor:pointer; }
-  #actionText { position:fixed; left:12px; z-index:9; background:rgba(255,255,255,.94); border:1px solid #d0d4da;
-    border-radius:6px; padding:4px 10px; font-size:12px; color:#4b5563; max-width:72%; }
-  #metrics { position:fixed; right:12px; z-index:9; background:#fff; border:1px solid #d0d4da; border-radius:8px;
-    font-size:12px; min-width:300px; box-shadow:0 2px 6px rgba(0,0,0,.05); overflow:hidden; }
-  .m-head, .m-row { display:grid; grid-template-columns:92px 1.1fr 1fr 1fr 1fr; gap:4px; padding:4px 8px; align-items:center; }
-  .m-head { background:#f3f5f8; color:#6b7280; border-bottom:1px solid #e5e7eb; font-size:11px; }
-  .m-row { border-bottom:1px solid #f0f2f5; color:#374151; }
+  html,body { width:100%; height:100%; overflow:hidden; background:var(--bg); }
+  body { font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; font-size:13px; color:var(--text);
+    user-select:none; -webkit-font-smoothing:antialiased; }
+
+  /* ============ 左侧控制面板(检查器式) ============ */
+  #toolbar { position:fixed; top:10px; left:10px; bottom:10px; width:266px; z-index:10;
+    display:flex; flex-direction:column;
+    background:var(--panel); backdrop-filter:blur(14px) saturate(1.3); -webkit-backdrop-filter:blur(14px) saturate(1.3);
+    border:1px solid var(--border); border-radius:var(--r-panel);
+    box-shadow:0 12px 32px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.05);
+    overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+    transition:transform .28s cubic-bezier(.2,.8,.25,1);
+    animation:panelIn .45s cubic-bezier(.2,.8,.25,1) both; }
+  @keyframes panelIn { from { opacity:0; transform:translateX(-14px); } to { opacity:1; transform:none; } }
+  body.panel-collapsed #toolbar { transform:translateX(calc(-100% - 16px)); }
+  #panelToggle { position:fixed; top:10px; left:10px; z-index:11; width:38px; height:38px; padding:0;
+    border-radius:10px; display:none; align-items:center; justify-content:center; font-size:16px;
+    background:var(--panel); backdrop-filter:blur(14px); border:1px solid var(--border); color:var(--text);
+    box-shadow:0 8px 20px rgba(0,0,0,.4); }
+  body.panel-collapsed #panelToggle { display:flex; }
+  .p-head { display:flex; align-items:center; justify-content:space-between; padding:14px 14px 10px; flex:none; }
+  .p-title { font-size:15px; font-weight:700; letter-spacing:.01em; display:flex; flex-direction:column; gap:2px; }
+  .p-sub { font-size:10px; font-weight:500; color:var(--text-3); letter-spacing:.18em; }
+  #btnCollapse { width:26px; height:26px; padding:0; border-radius:7px; color:var(--text-3); font-size:13px; line-height:1; }
+  .p-sec { padding:10px 14px 12px; border-top:1px solid var(--border-soft); display:flex; flex-direction:column; gap:8px; flex:none; }
+  .p-sec-label { font-size:11px; color:var(--text-3); letter-spacing:.14em; font-weight:600;
+    display:flex; align-items:center; justify-content:space-between; }
+  .p-count { font-family:var(--mono); font-size:10px; letter-spacing:.04em; color:var(--text-3);
+    border:1px solid var(--border-soft); border-radius:999px; padding:1px 7px; }
+  .p-sec select { width:100%; }
+  .p-row { display:flex; gap:6px; flex-wrap:wrap; min-width:0; }
+  .p-row > button { flex:1 1 0; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    padding-left:5px; padding-right:5px; font-size:12px; }
+  .p-row > select { flex:0 0 auto; min-width:58px; font-size:12px; }
+  .p-play { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:5px; }
+  .p-play > select { min-width:0; width:100%; padding-left:6px; padding-right:19px; }
+  .p-row > button.ctl-on { background:var(--run); border-color:transparent; color:#fff;
+    box-shadow:0 1px 8px rgba(59,140,245,.45); }
+  .p-big { height:34px; font-size:14px; }
+  .p-wide { width:100%; }
+  .p-field { display:flex; flex-direction:column; gap:6px; }
+  .p-field-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; font-size:12px; color:var(--text-2); }
+  .p-field input[type=range] { width:100%; }
+  .p-check { display:inline-flex; align-items:center; gap:6px; color:var(--text-2); font-size:12.5px; flex:1; }
+  /* 分段选择器(radio 胶囊) */
+  .p-seg { display:grid; grid-auto-flow:column; grid-auto-columns:1fr; gap:4px;
+    background:rgba(0,0,0,.22); border:1px solid var(--border-soft); border-radius:9px; padding:3px; }
+  .p-seg2 { grid-auto-flow:row; grid-template-columns:1fr 1fr; }
+  .p-seg label { position:relative; display:block; }
+  .p-seg input { position:absolute; opacity:0; pointer-events:none; }
+  .p-seg label span { display:flex; align-items:center; justify-content:center; height:24px; border-radius:6px;
+    font-size:12px; color:var(--text-2); cursor:pointer; transition:background .15s ease, color .15s ease; white-space:nowrap; }
+  .p-seg label:hover span { color:var(--text); }
+  .p-seg label:has(input:checked) span { background:var(--run); color:#fff; font-weight:600;
+    box-shadow:0 1px 6px rgba(59,140,245,.45); }
+  .p-seg label:has(input:focus-visible) span { outline:2px solid var(--accent); outline-offset:1px; }
+
+  /* ============ 控件 ============ */
+  select, button { font:inherit; color:var(--text); background:var(--panel-2);
+    border:1px solid var(--border); border-radius:var(--r-ctl); padding:4px 10px; height:28px;
+    cursor:pointer; transition:background .15s ease, border-color .15s ease, box-shadow .15s ease, transform .06s ease; }
+  button:hover:not(:disabled), select:hover { background:var(--panel-3); border-color:#3a4557; }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:disabled { opacity:.4; cursor:default; }
+  button.primary { background:linear-gradient(180deg, var(--run-hi), var(--run)); border-color:transparent; color:#fff;
+    font-weight:600; box-shadow:0 2px 10px rgba(59,140,245,.35), inset 0 1px 0 rgba(255,255,255,.18); }
+  button.primary:hover:not(:disabled) { background:linear-gradient(180deg, #6fb0ff, #4a95f8);
+    box-shadow:0 4px 16px rgba(59,140,245,.5), inset 0 1px 0 rgba(255,255,255,.22); }
+  select { appearance:none; -webkit-appearance:none; padding-right:24px; min-width:96px;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238d9ab0' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 8px center; }
+  select option { background:var(--panel-solid); color:var(--text); }
+  :is(button,select,input,label):focus-visible { outline:2px solid var(--accent); outline-offset:1px; border-radius:var(--r-ctl); }
+
+  input[type=range] { -webkit-appearance:none; appearance:none; width:90px; height:4px; border-radius:2px;
+    background:linear-gradient(90deg, var(--run) var(--fill,50%), #2c3546 var(--fill,50%)); outline-offset:4px; cursor:pointer; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:14px; height:14px; border-radius:50%;
+    background:#e8eef7; border:2px solid var(--run); box-shadow:0 1px 4px rgba(0,0,0,.5); transition:transform .15s ease; }
+  input[type=range]::-webkit-slider-thumb:hover { transform:scale(1.2); }
+  input[type=range]::-moz-range-thumb { width:12px; height:12px; border-radius:50%; background:#e8eef7; border:2px solid var(--run); }
+  input[type=radio], input[type=checkbox] { accent-color:var(--run); width:14px; height:14px; }
+  label { display:inline-flex; align-items:center; gap:3px; cursor:pointer; color:var(--text-2); transition:color .15s ease; }
+  label:hover { color:var(--text); }
+  .val { font-family:var(--mono); font-variant-numeric:tabular-nums; color:var(--text-2); font-size:12px; }
+
+  /* ============ 状态页脚(面板内,恒定单行) ============ */
+  #actionText { position:sticky; bottom:0; margin-top:auto; flex:none; background:var(--panel-solid);
+    border-top:1px solid var(--border-soft); padding:9px 14px; font-size:12px; color:var(--text-2);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #actionText::before { content:''; display:inline-block; width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 8px rgba(245,181,63,.8); margin-right:7px; vertical-align:1px; }
+
+  /* ============ 遥测面板 ============ */
+  #metrics { position:fixed; right:10px; top:10px; z-index:9; background:var(--panel); backdrop-filter:blur(10px);
+    border:1px solid var(--border); border-radius:12px; font-size:12px; min-width:312px;
+    max-height:70vh; overflow-y:auto; scrollbar-width:thin;
+    box-shadow:0 10px 28px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.04);
+    animation:panelFade .45s .14s cubic-bezier(.2,.8,.25,1) both; }
+  @keyframes panelFade { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:none; } }
+  .m-head, .m-row { display:grid; grid-template-columns:96px 1.1fr 1fr 1fr 1fr; gap:4px; padding:5px 10px; align-items:center; }
+  .m-head { background:rgba(255,255,255,.03); color:var(--text-3); border-bottom:1px solid var(--border-soft);
+    font-size:11px; letter-spacing:.04em; }
+  .m-row { border-bottom:1px solid rgba(255,255,255,.04); color:var(--text-2); }
   .m-row:last-child { border-bottom:none; }
-  .m-row.live { background:#eef4ff; font-weight:600; }
-  #cv { display:block; }
+  .m-row span:nth-child(n+2) { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .m-row.live { color:var(--text); font-weight:600; background:linear-gradient(90deg, rgba(245,181,63,.10), transparent 60%);
+    box-shadow:inset 2px 0 0 var(--accent); }
+  .m-empty { padding:10px 12px; color:var(--text-3); font-size:12px; }
+
+  @media (max-width: 560px){
+    #metrics { left:10px; right:10px; min-width:0; }
+  }
+  #cv { display:block; cursor:crosshair; }
+  @media (prefers-reduced-motion: reduce) {
+    #toolbar, #actionText, #metrics { animation:none; }
+    * { transition:none !important; }
+  }
 </style>
 </head>
 <body>
 
-<div id="toolbar">
-  <span class="grp"><span class="grp-label">算法</span><select id="algSel"></select></span>
-  <span class="grp"><span class="grp-label">工具:</span>
-    <label><input type="radio" name="tool" value="goal" checked>设置终点</label>
-    <label><input type="radio" name="tool" value="place">放置障碍</label>
-    <label><input type="radio" name="tool" value="delete">删除障碍</label>
-    <label><input type="radio" name="tool" value="patrol">障碍路径</label>
-  </span>
-  <span class="grp"><span class="grp-label">移动障碍:</span>
-    <label><input type="checkbox" id="moveChk">启用</label>
-    <label><input type="checkbox" id="persistChk">持续寻路</label>
-    <span class="grp-label">速度</span>
-    <input type="range" id="moveSpeedRange" min="0" max="120" step="5" value="40"><span id="moveSpeedVal" style="min-width:28px">40</span>
-    <button id="btnRandomMove">随机移动</button>
-    <button id="btnClearPatrol">清除移动</button>
-  </span>
-  <span class="grp"><span class="grp-label">覆盖率</span>
-    <input type="range" id="coverRange" min="2" max="40" step="1" value="12"><span id="coverVal" style="min-width:130px">12%</span>
-    <button id="btnRegen">重新生成</button>
-  </span>
-  <span class="grp">
-    <button id="btnStart" class="primary">开始寻路</button>
-    <button id="btnPlay">⏵ 播放</button>
-    <button id="btnPause">⏸ 暂停</button>
-    <button id="btnStep">⏭ 单步</button>
-    <select id="speedSel">
-      <option value="0.5">0.5×</option>
-      <option value="1" selected>1×</option>
-      <option value="2">2×</option>
-      <option value="4">4×</option>
-    </select>
-  </span>
-  <span class="grp"><span class="grp-label">速度</span>
-    <input type="range" id="speedRange" min="0" max="300" step="5" value="120"><span id="speedVal" style="min-width:28px">120</span>
-  </span>
-  <span class="grp"><span class="grp-label">转向角</span>
-    <input type="range" id="steerRange" min="-40" max="40" step="1" value="0"><span id="steerVal" style="min-width:34px">0°</span>
-    <label><input type="checkbox" id="manualChk">手动转向</label>
-  </span>
-  <span class="grp"><span class="grp-label">路径:</span>
-    <label><input type="radio" name="path" value="line" checked>直线</label>
-    <label><input type="radio" name="path" value="spline">样条</label>
-  </span>
-  <span class="grp">
-    <button id="btnReplan" disabled>重规划</button>
-    <button id="btnReset">重置</button>
-    <button id="btnResetStart">重置起点</button>
-  </span>
-</div>
+<button id="panelToggle" title="打开控制面板">☰</button>
+<aside id="toolbar">
+  <div class="p-head">
+    <div class="p-title">小车寻路<span class="p-sub">PATHFINDING LAB</span></div>
+    <button id="btnCollapse" title="收起面板">⟨</button>
+  </div>
 
-<div id="actionText">就绪:点击空地设置终点,或选工具编辑障碍物</div>
+  <section class="p-sec">
+    <div class="p-sec-label">算法<span class="p-count" id="algCount"></span></div>
+    <select id="algSel"></select>
+    <button id="btnStart" class="primary p-big">开始寻路</button>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">播放控制</div>
+    <div class="p-row p-play">
+      <button id="btnPlay">⏵ 播放</button>
+      <button id="btnPause">⏸ 暂停</button>
+      <button id="btnStep">⏭ 单步</button>
+      <select id="speedSel">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+      </select>
+    </div>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">工具</div>
+    <div class="p-seg p-seg2">
+      <label><input type="radio" name="tool" value="goal" checked><span>设置终点</span></label>
+      <label><input type="radio" name="tool" value="place"><span>放置障碍</span></label>
+      <label><input type="radio" name="tool" value="delete"><span>删除障碍</span></label>
+      <label><input type="radio" name="tool" value="patrol"><span>障碍路径</span></label>
+    </div>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">路径</div>
+    <div class="p-seg">
+      <label><input type="radio" name="path" value="line" checked><span>直线</span></label>
+      <label><input type="radio" name="path" value="spline"><span>样条</span></label>
+    </div>
+    <div class="p-seg">
+      <label><input type="radio" name="pathStyle" value="line" checked><span>绿线</span></label>
+      <label><input type="radio" name="pathStyle" value="fsd"><span>FSD 引导</span></label>
+    </div>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">环境</div>
+    <div class="p-field">
+      <div class="p-field-head"><span>障碍覆盖率</span><span class="val" id="coverVal">12%</span></div>
+      <input type="range" id="coverRange" min="2" max="40" step="1" value="12">
+    </div>
+    <button id="btnRegen" class="p-wide">重新生成障碍</button>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">移动障碍</div>
+    <div class="p-row">
+      <label class="p-check"><input type="checkbox" id="moveChk"><span>启用移动</span></label>
+      <label class="p-check"><input type="checkbox" id="persistChk" disabled><span>持续寻路</span></label>
+    </div>
+    <div class="p-field">
+      <div class="p-field-head"><span>移动速度</span><span class="val" id="moveSpeedVal">40</span></div>
+      <input type="range" id="moveSpeedRange" min="0" max="120" step="5" value="40">
+    </div>
+    <div class="p-row">
+      <button id="btnRandomMove" disabled>随机移动</button>
+      <button id="btnClearPatrol">清除移动</button>
+    </div>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">车辆</div>
+    <div class="p-field">
+      <div class="p-field-head"><span>行驶速度</span><span class="val" id="speedVal">120</span></div>
+      <input type="range" id="speedRange" min="0" max="300" step="5" value="120">
+    </div>
+    <div class="p-field">
+      <div class="p-field-head"><span>转向角</span><span class="val" id="steerVal">0°</span></div>
+      <input type="range" id="steerRange" min="-40" max="40" step="1" value="0">
+    </div>
+    <label class="p-check"><input type="checkbox" id="manualChk"><span>手动转向</span></label>
+  </section>
+
+  <section class="p-sec">
+    <div class="p-sec-label">操作</div>
+    <div class="p-row">
+      <button id="btnReplan" disabled>重规划</button>
+      <button id="btnReset">重置</button>
+      <button id="btnResetStart">重置起点</button>
+    </div>
+  </section>
+
+  <div id="actionText">就绪:点击空地设置终点,或选工具编辑障碍物</div>
+</aside>
+
 <div id="metrics"></div>
 <canvas id="cv"></canvas>
 
@@ -109,14 +270,14 @@ const PRM_N = 2000, PRM_K = 8; /* 地图扩大后采样点按面积比例增加 
 const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
 const SQRT2 = Math.SQRT2;
 const COLORS = {
-  bg:'#f7f8fa', outside:'#e8eaee', worldBorder:'#d0d4da', gridLine:'#eef0f4',
-  obstacle:'#c8ccd4', obstacleEdge:'#9aa0aa',
-  open:'#ffd166', closed:'#b8c4d8', current:'#ff8a5c',
-  backOpen:'#e2b3f5', backClosed:'#b98ad6',
-  edge:'#9fb4d8', tree:'#9fb4d8', rewire:'#a06cd5', replan:'#e5b8f5',
-  sample:'#7aa2f7', traj:'#8fd0c8',
-  path:'#2f9e6e', start:'#2f6fd8', goal:'#e11d48',
-  car:'#2f6fd8', carEdge:'#1f4f9e', wheel:'#16294d', force:'#ff8a5c', flash:'#e11d48'
+  bg:'#12161d', outside:'#0b0e13', worldBorder:'#4a5a72', gridLine:'#1a212c',
+  obstacle:'#3d4658', obstacleEdge:'#5b667c',
+  open:'#f5b53f', closed:'#31435f', current:'#fb8c4c',
+  backOpen:'#b07ce8', backClosed:'#6f49a8',
+  edge:'#42619a', tree:'#42619a', rewire:'#9a7be0', replan:'#d97ce8',
+  sample:'#5b93f0', traj:'#2fbfa9',
+  path:'#2ecc8f', start:'#38bdf8', goal:'#f2607f',
+  car:'#3b8cf5', carEdge:'#bcd6ff', wheel:'#0a0f18', force:'#fb8c4c', flash:'#f2607f'
 };
 const ALGORITHMS = [
   { id:'astar',    name:'A*' },
@@ -153,6 +314,7 @@ const btnRegen = IS_WORKER ? null : $('btnRegen'), btnStart = IS_WORKER ? null :
 const btnStep = IS_WORKER ? null : $('btnStep'), speedSel = IS_WORKER ? null : $('speedSel'), speedRange = IS_WORKER ? null : $('speedRange'), speedVal = IS_WORKER ? null : $('speedVal');
 const steerRange = IS_WORKER ? null : $('steerRange'), steerVal = IS_WORKER ? null : $('steerVal'), manualChk = IS_WORKER ? null : $('manualChk');
 const btnReplan = IS_WORKER ? null : $('btnReplan'), btnReset = IS_WORKER ? null : $('btnReset'), btnResetStart = IS_WORKER ? null : $('btnResetStart');
+const panelToggle = IS_WORKER ? null : $('panelToggle'), btnCollapse = IS_WORKER ? null : $('btnCollapse'), algCount = IS_WORKER ? null : $('algCount');
 const moveChk = IS_WORKER ? null : $('moveChk'), persistChk = IS_WORKER ? null : $('persistChk'), moveSpeedRange = IS_WORKER ? null : $('moveSpeedRange'), moveSpeedVal = IS_WORKER ? null : $('moveSpeedVal'), btnRandomMove = IS_WORKER ? null : $('btnRandomMove'), btnClearPatrol = IS_WORKER ? null : $('btnClearPatrol');
 if (!IS_WORKER) ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
 
@@ -163,7 +325,7 @@ const goal = { x: W-160, y: H-160 };
 const car = { x: start.x, y: start.y, theta: 0, v: 0, delta: 0, collided: false };
 let mode = 'idle', algo = null, running = false, dliteDirty = false;
 let APF_SPEED = 120; /* 势场法推进速度:Worker 无 DOM,由主线程随 start 消息下发 */
-let algId = 'astar', pathMode = 'line', manualSteer = false, speedMult = 1;
+let algId = 'astar', pathMode = 'line', pathStyle = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
 let selectedObstacle = null;
 let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
@@ -270,9 +432,7 @@ function resizeCanvas(){
   c2.setTransform(dpr,0,0,dpr,0,0);
 }
 function layout(){
-  const tbH = toolbarEl.offsetHeight;
-  actionEl.style.top = (tbH + 8) + 'px';
-  metricsEl.style.top = (tbH + 8) + 'px';
+  /* 面板/遥测卡由 CSS 定位;此处仅保留窗口尺寸归一化钩子 */
 }
 
 /* ============ 车辆 ============ */
@@ -3018,6 +3178,7 @@ function resetCarToStart(){
 function visPathFromAlgo(){
   vis.path.length = 0;
   if (algo && algo.path) for (const p of algo.path) vis.path.push(p);
+  if (!IS_WORKER && vis.path.length >= 2) vis.pathT0 = performance.now(); /* 触发揭示动画 */
 }
 function startSearch(){
   if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
@@ -3494,6 +3655,7 @@ const RRT_TREE_IDS = new Set(['rrt','rrtstar','informedrrt','rrtsmart']);
 /* ============ 指标面板 ============ */
 function renderMetrics(){
   let html = '<div class="m-head"><span>算法</span><span>长度(px)</span><span>扩展</span><span>耗时</span><span>碰撞</span></div>';
+  if (!metricsLive.alg && !metricsHistory.length) html += '<div class="m-empty">运行算法后在此显示遥测数据</div>';
   if (metricsLive.alg){
     html += '<div class="m-row live"><span>'+metricsLive.alg+'</span><span>'+metricsLive.pathLen.toFixed(0)+'</span><span>'+metricsLive.expanded+'</span><span>'+metricsLive.timeMs.toFixed(0)+'ms</span><span>'+metricsLive.collisions+'</span></div>';
   }
@@ -3644,10 +3806,14 @@ function drawAlgoLayers(ctx, view){
     }
     ctx.globalAlpha = 1;
   }
-  // 当前扩展点
+  // 当前扩展点(实心点 + 脉冲环)
   if (vis.current){
     ctx.fillStyle = c.current;
     ctx.beginPath(); ctx.arc(vis.current.x, vis.current.y, 5, 0, 7); ctx.fill();
+    const ph = (performance.now() % 900) / 900;
+    ctx.strokeStyle = 'rgba(251,140,76,' + (0.85*(1-ph)).toFixed(3) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(vis.current.x, vis.current.y, 6 + ph*18, 0, 7); ctx.stroke();
   }
   // 蚁群蚂蚁(A 群紫 / B 群橙)
   if (algo && algo.id === 'aco' && algo.antsA){
@@ -3662,40 +3828,159 @@ function drawAlgoLayers(ctx, view){
       }
     }
   }
-  // 最终路径
-  if (vis.path.length >= 2){
-    ctx.strokeStyle = c.path; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(vis.path[0].x, vis.path[0].y);
-    for (let i=1;i<vis.path.length;i++){
-      if (!rectInView(vis.path[i].x, vis.path[i].y, 1, 1, view)) continue;
-      ctx.lineTo(vis.path[i].x, vis.path[i].y);
+  // 最终路径(两种材质 + 新解揭示动画)
+  if (vis.path.length >= 2) drawPath2D(ctx, vis.path);
+}
+/* 路径材质:line = 绿色实线;fsd = FSD 式引导带(近车浓、远端淡 + 流动箭头) */
+function drawPath2D(ctx, P){
+  const now = performance.now();
+  /* 弧长参数化 */
+  const cum = new Float64Array(P.length); cum[0] = 0;
+  for (let i=1;i<P.length;i++) cum[i] = cum[i-1] + Math.hypot(P[i].x-P[i-1].x, P[i].y-P[i-1].y);
+  const total = cum[P.length-1];
+  if (!(total > 0)) return;
+  /* 揭示动画:新解沿途点亮(0.7s,ease-out) */
+  let reveal = 1;
+  if (vis.pathT0){
+    reveal = Math.min(1, (now - vis.pathT0) / 700);
+    if (reveal >= 1) vis.pathT0 = 0;
+  }
+  const shown = total * (reveal >= 1 ? 1 : 1 - Math.pow(1-reveal, 3));
+  /* 取任意弧长处的点与切向(二分定位) */
+  const at = (d) => {
+    let lo = 0, hi = P.length-1;
+    while (lo < hi){ const mid = (lo+hi) >> 1; if (cum[mid] < d) lo = mid+1; else hi = mid; }
+    const i = Math.max(1, lo), f = (d - cum[i-1]) / Math.max(1e-6, cum[i]-cum[i-1]);
+    const a = P[i-1], b = P[i];
+    return { x:a.x+(b.x-a.x)*f, y:a.y+(b.y-a.y)*f, dx:b.x-a.x, dy:b.y-a.y };
+  };
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  /* 世界→屏幕折算:线宽恒定于屏幕(不随缩放变细/变粗) */
+  const zk = 1 / Math.max(0.05, cam.scale);
+  if (pathStyle === 'fsd'){
+    /* 车在路径上的弧长位置:近车实、向前渐隐(参考 Tesla FSD 引导线) */
+    let sCar = 0, bestD = Infinity;
+    for (let i=0;i<P.length;i++){
+      const dd = (P[i].x-car.x)*(P[i].x-car.x) + (P[i].y-car.y)*(P[i].y-car.y);
+      if (dd < bestD){ bestD = dd; sCar = cum[i]; }
     }
-    ctx.stroke();
+    const ahead = Math.max(1, shown - sCar);
+    const M = 64, step = shown / M;
+    const fseg = (i) => Math.max(0, Math.min(1, ((i+0.5)*step - sCar) / ahead));
+    /* 外描边:让引导带在任何底色上都有清晰轮廓 */
+    ctx.strokeStyle = 'rgba(6,14,26,.45)'; ctx.lineWidth = 30*zk;
+    for (let i=0;i<M;i++){
+      const a = at(i*step + 1e-3), b = at((i+1)*step);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    /* 引导带:车后实、车前渐隐 */
+    for (let i=0;i<M;i++){
+      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
+      ctx.strokeStyle = 'rgba(56,189,248,' + (0.50*(1 - f*0.72)).toFixed(3) + ')';
+      ctx.lineWidth = 24*zk * (1 - f*0.25);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    /* 亮芯 */
+    for (let i=0;i<M;i++){
+      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
+      ctx.strokeStyle = 'rgba(186,230,253,' + (0.85*(1 - f*0.55)).toFixed(3) + ')';
+      ctx.lineWidth = 10*zk * (1 - f*0.2);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    /* 中心亮线 */
+    for (let i=0;i<M;i++){
+      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
+      ctx.strokeStyle = 'rgba(240,250,255,' + (0.98*(1 - f*0.45)).toFixed(3) + ')';
+      ctx.lineWidth = 3.6*zk;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    /* 流动箭头:只画在车前方,屏幕尺度恒定 */
+    const spacing = 120*zk, off = (now/1000*150*zk) % spacing;
+    ctx.strokeStyle = 'rgba(240,250,255,.95)'; ctx.lineWidth = 4*zk;
+    for (let d = sCar + (spacing - off); d < shown - 30*zk; d += spacing){
+      const p = at(d), L = Math.hypot(p.dx,p.dy) || 1, ux = p.dx/L, uy = p.dy/L;
+      const px = -uy, py = ux;
+      ctx.beginPath();
+      ctx.moveTo(p.x - ux*10*zk + px*7*zk, p.y - uy*10*zk + py*7*zk);
+      ctx.lineTo(p.x, p.y);
+      ctx.lineTo(p.x - ux*10*zk - px*7*zk, p.y - uy*10*zk - py*7*zk);
+      ctx.stroke();
+    }
+  } else {
+    /* 绿色实线 + 轻辉光 */
+    const stroke = () => {
+      ctx.beginPath();
+      ctx.moveTo(P[0].x, P[0].y);
+      for (let i=1;i<P.length;i++){
+        if (cum[i] > shown){
+          const p = at(shown);
+          ctx.lineTo(p.x, p.y); break;
+        }
+        ctx.lineTo(P[i].x, P[i].y);
+      }
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.strokeStyle = 'rgba(6,14,26,.5)'; ctx.lineWidth = 8.5*zk; stroke(); /* 轮廓 */
+    ctx.shadowColor = 'rgba(46,204,143,.6)'; ctx.shadowBlur = 14;
+    ctx.strokeStyle = COLORS.path; ctx.lineWidth = 5*zk; stroke();
+    ctx.restore();
+  }
+  /* 揭示头部光点 */
+  if (reveal < 1){
+    const h = at(shown);
+    ctx.save();
+    ctx.fillStyle = pathStyle === 'fsd' ? '#9adcff' : '#5ff0b0';
+    ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 18;
+    ctx.beginPath(); ctx.arc(h.x, h.y, 5.5, 0, 7); ctx.fill();
+    ctx.restore();
   }
 }
 function drawCar(ctx){
   if (!car) return;
   const flash = (mode === 'failed' && car.collided) && (performance.now()-flashStart < 1000) && (Math.floor(performance.now()/100)%2 === 0);
-  const corners = obbCorners(car.x, car.y, car.theta, CAR_L, CAR_W);
-  ctx.fillStyle = flash ? COLORS.flash : COLORS.car;
-  ctx.beginPath(); ctx.moveTo(corners[0][0],corners[0][1]);
-  for (const p of corners) ctx.lineTo(p[0],p[1]);
+  const L = CAR_L, HW = CAR_W/2;
+  ctx.save();
+  ctx.translate(car.x, car.y); ctx.rotate(car.theta);
+  /* 航向光锥(读向性) */
+  const cone = ctx.createLinearGradient(L/2, 0, L/2+70, 0);
+  cone.addColorStop(0, 'rgba(120,200,255,.20)'); cone.addColorStop(1, 'rgba(120,200,255,0)');
+  ctx.fillStyle = cone;
+  ctx.beginPath(); ctx.moveTo(L/2-4, -6); ctx.lineTo(L/2+70, -30); ctx.lineTo(L/2+70, 30); ctx.lineTo(L/2-4, 6);
   ctx.closePath(); ctx.fill();
-  ctx.strokeStyle = COLORS.carEdge; ctx.lineWidth = 1.5; ctx.stroke();
-  // 车轮
-  function wheel(off, ang){
-    const wx = car.x + Math.cos(car.theta)*off, wy = car.y + Math.sin(car.theta)*off;
-    ctx.save(); ctx.translate(wx,wy); ctx.rotate(ang);
-    ctx.fillStyle = COLORS.wheel; ctx.fillRect(-3,-8,6,16);
+  /* 四轮(前轮随转向角) */
+  const wheel = (wx, wy, ang) => {
+    ctx.save(); ctx.translate(wx, wy); ctx.rotate(ang);
+    ctx.fillStyle = COLORS.wheel;
+    ctx.beginPath(); ctx.roundRect(-5, -3.6, 10, 7.2, 2.4); ctx.fill();
     ctx.restore();
-  }
-  wheel(WHEELBASE/2, car.theta + car.delta);
-  wheel(-WHEELBASE/2, car.theta);
-  // 车头指示
-  const nx = car.x + Math.cos(car.theta)*(CAR_L/2+6), ny = car.y + Math.sin(car.theta)*(CAR_L/2+6);
-  ctx.fillStyle = '#fff';
-  ctx.beginPath(); ctx.arc(nx,ny,3,0,7); ctx.fill();
+  };
+  wheel(WHEELBASE/2, -HW+1.5, car.delta); wheel(WHEELBASE/2, HW-1.5, car.delta);
+  wheel(-WHEELBASE/2, -HW+1.5, 0); wheel(-WHEELBASE/2, HW-1.5, 0);
+  /* 车身(上缘受光,下缘渐暗) */
+  const body = ctx.createLinearGradient(0, -HW, 0, HW);
+  body.addColorStop(0, flash ? COLORS.flash : '#7ab8ff');
+  body.addColorStop(0.45, flash ? COLORS.flash : COLORS.car);
+  body.addColorStop(1, flash ? COLORS.flash : '#1f5cb8');
+  ctx.fillStyle = body;
+  ctx.beginPath(); ctx.roundRect(-L/2, -HW, L, CAR_W, 8); ctx.fill();
+  ctx.strokeStyle = COLORS.carEdge; ctx.lineWidth = 1.4; ctx.stroke();
+  /* 座舱玻璃 + 挡风高光 */
+  ctx.fillStyle = 'rgba(12,22,38,.85)';
+  ctx.beginPath(); ctx.roundRect(-L/2+13, -HW+5, 26, CAR_W-10, 6); ctx.fill();
+  ctx.strokeStyle = 'rgba(150,205,255,.45)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = 'rgba(180,220,255,.22)';
+  ctx.beginPath(); ctx.roundRect(-L/2+15, -HW+6.5, 7, CAR_W-13, 3); ctx.fill();
+  /* 前照灯(带辉光) */
+  ctx.fillStyle = '#eaf7ff';
+  ctx.shadowColor = 'rgba(180,230,255,.9)'; ctx.shadowBlur = 8;
+  ctx.beginPath(); ctx.roundRect(L/2-9, -HW+3.5, 5, 6, 2); ctx.fill();
+  ctx.beginPath(); ctx.roundRect(L/2-9, HW-9.5, 5, 6, 2); ctx.fill();
+  /* 尾灯 */
+  ctx.shadowColor = 'rgba(255,80,110,.85)'; ctx.fillStyle = '#ff5a72';
+  ctx.beginPath(); ctx.roundRect(-L/2+4, -HW+3.5, 4, 5.5, 2); ctx.fill();
+  ctx.beginPath(); ctx.roundRect(-L/2+4, HW-9, 4, 5.5, 2); ctx.fill();
+  ctx.restore();
 }
 function render(){
   c2.fillStyle = COLORS.outside; c2.fillRect(0,0,vw,vh);
@@ -3721,8 +4006,9 @@ function render(){
   // 障碍物
   for (const o of world.obstacles){
     if (!rectInView(o.x,o.y,o.w,o.h,view)) continue;
-    c2.fillStyle = COLORS.obstacle; c2.fillRect(o.x,o.y,o.w,o.h);
-    c2.strokeStyle = COLORS.obstacleEdge; c2.lineWidth = 1; c2.strokeRect(o.x,o.y,o.w,o.h);
+    c2.beginPath(); c2.roundRect(o.x, o.y, o.w, o.h, 3);
+    c2.fillStyle = COLORS.obstacle; c2.fill();
+    c2.strokeStyle = COLORS.obstacleEdge; c2.lineWidth = 1; c2.stroke();
   }
   // 选中障碍(移动路径编辑)
   if (selectedObstacle){
@@ -3771,6 +4057,27 @@ function render(){
   }
   drawCar(c2);
   c2.restore();
+}
+
+/* ============ 播放态与移动门控(strict 模式下必须顶层声明,块内声明不外泄) ============ */
+let pbState = '';
+/* 空闲时禁用 播放/暂停/单步,运行中高亮"暂停",消除"点了没反应" */
+function syncPlaybackUI(){
+  const active = (mode === 'searching' || mode === 'following');
+  const key = active + ':' + running + ':' + mode;
+  if (key === pbState) return;
+  pbState = key;
+  btnPlay.disabled = !active || running;
+  btnPause.disabled = !active || !running;
+  btnStep.disabled = !active || (running && mode === 'searching');
+  btnPause.classList.toggle('ctl-on', active && running);
+}
+/* 移动障碍门控:未启用移动时,持续寻路/随机移动不可用 */
+function syncMoveGate(){
+  const on = moveChk.checked;
+  persistChk.disabled = !on;
+  btnRandomMove.disabled = !on;
+  if (!on) persistChk.checked = false;
 }
 
 /* ============ 主循环 ============ */
@@ -3833,6 +4140,7 @@ function loop(t){
   if (mode === 'following' || (replanning && mode === 'searching')){ cam.x = car.x; cam.y = car.y; }
   updateMovingObstacles(dt);
   render();
+  syncPlaybackUI();
 }
 
 /* ============ 输入(仅主线程) ============ */
@@ -3941,7 +4249,8 @@ btnStart.addEventListener('click', startSearch);
 btnPlay.addEventListener('click', () => {
   if (mode === 'searching' || mode === 'following'){ running = true; }
 });
-btnPause.addEventListener('click', () => { running = false; });
+btnPause.addEventListener('click', () => { running = false; syncPlaybackUI(); });
+moveChk.addEventListener('change', syncMoveGate);
 btnStep.addEventListener('click', () => {
   if (mode === 'searching' && algo && !algo.done){
     running = false;
@@ -3953,6 +4262,11 @@ btnStep.addEventListener('click', () => {
   }
 });
 speedSel.addEventListener('change', () => { speedMult = +speedSel.value; });
+/* 滑条填充进度(自定义轨道渐变) */
+document.querySelectorAll('input[type=range]').forEach(r => {
+  const updFill = () => r.style.setProperty('--fill', ((r.value - r.min) / (r.max - r.min) * 100) + '%');
+  r.addEventListener('input', updFill); updFill();
+});
 speedRange.addEventListener('input', () => { speedVal.textContent = speedRange.value; });
 steerRange.addEventListener('input', () => { steerVal.textContent = steerRange.value + '°'; });
 manualChk.addEventListener('change', () => {
@@ -3993,6 +4307,7 @@ btnClearPatrol.addEventListener('click', () => {
   }
 });
 document.querySelectorAll('input[name=path]').forEach(r => r.addEventListener('change', () => { pathMode = document.querySelector('input[name=path]:checked').value; }));
+document.querySelectorAll('input[name=pathStyle]').forEach(r => r.addEventListener('change', () => { pathStyle = document.querySelector('input[name=pathStyle]:checked').value; }));
 btnReplan.addEventListener('click', doReplan);
 btnReset.addEventListener('click', () => {
   abortRun();
@@ -4113,6 +4428,14 @@ grid.buildFromWorld();
 setupWorkers();
 updateCoverDisplay();
 layout();
+renderMetrics(); /* 初始即显示空态提示 */
+syncPlaybackUI();
+syncMoveGate();
+algCount.textContent = ALGORITHMS.length + ' 种';
+/* 面板折叠:窄屏默认收起 */
+panelToggle.addEventListener('click', () => document.body.classList.remove('panel-collapsed'));
+btnCollapse.addEventListener('click', () => document.body.classList.add('panel-collapsed'));
+if (window.innerWidth < 900) document.body.classList.add('panel-collapsed');
 requestAnimationFrame(loop);
 }
 </script>
