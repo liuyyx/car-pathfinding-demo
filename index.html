@@ -431,9 +431,6 @@ function resizeCanvas(){
   canvas.style.width = vw+'px'; canvas.style.height = vh+'px';
   c2.setTransform(dpr,0,0,dpr,0,0);
 }
-function layout(){
-  /* 面板/遥测卡由 CSS 定位;此处仅保留窗口尺寸归一化钩子 */
-}
 
 /* ============ 车辆 ============ */
 function carStep(c,dt){
@@ -3858,53 +3855,54 @@ function drawPath2D(ctx, P){
   /* 世界→屏幕折算:线宽恒定于屏幕(不随缩放变细/变粗) */
   const zk = 1 / Math.max(0.05, cam.scale);
   if (pathStyle === 'fsd'){
-    /* 车在路径上的弧长位置:近车实、向前渐隐(参考 Tesla FSD 引导线) */
+    /* FSD 式引导线:自车头向前延伸的柔边蓝色光束,远端溶解(参考 Tesla FSD 可视化)
+       用多边形带 + 沿弧长渐变填充实现:无逐段端帽重叠,折角处不会出现亮珠 */
     let sCar = 0, bestD = Infinity;
     for (let i=0;i<P.length;i++){
       const dd = (P[i].x-car.x)*(P[i].x-car.x) + (P[i].y-car.y)*(P[i].y-car.y);
       if (dd < bestD){ bestD = dd; sCar = cum[i]; }
     }
-    const ahead = Math.max(1, shown - sCar);
-    const M = 64, step = shown / M;
-    const fseg = (i) => Math.max(0, Math.min(1, ((i+0.5)*step - sCar) / ahead));
-    /* 外描边:让引导带在任何底色上都有清晰轮廓 */
-    ctx.strokeStyle = 'rgba(6,14,26,.45)'; ctx.lineWidth = 30*zk;
-    for (let i=0;i<M;i++){
-      const a = at(i*step + 1e-3), b = at((i+1)*step);
-      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-    }
-    /* 引导带:车后实、车前渐隐 */
-    for (let i=0;i<M;i++){
-      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
-      ctx.strokeStyle = 'rgba(56,189,248,' + (0.50*(1 - f*0.72)).toFixed(3) + ')';
-      ctx.lineWidth = 24*zk * (1 - f*0.25);
-      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-    }
-    /* 亮芯 */
-    for (let i=0;i<M;i++){
-      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
-      ctx.strokeStyle = 'rgba(186,230,253,' + (0.85*(1 - f*0.55)).toFixed(3) + ')';
-      ctx.lineWidth = 10*zk * (1 - f*0.2);
-      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-    }
-    /* 中心亮线 */
-    for (let i=0;i<M;i++){
-      const f = fseg(i), a = at(i*step + 1e-3), b = at((i+1)*step);
-      ctx.strokeStyle = 'rgba(240,250,255,' + (0.98*(1 - f*0.45)).toFixed(3) + ')';
-      ctx.lineWidth = 3.6*zk;
-      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-    }
-    /* 流动箭头:只画在车前方,屏幕尺度恒定 */
-    const spacing = 120*zk, off = (now/1000*150*zk) % spacing;
-    ctx.strokeStyle = 'rgba(240,250,255,.95)'; ctx.lineWidth = 4*zk;
-    for (let d = sCar + (spacing - off); d < shown - 30*zk; d += spacing){
-      const p = at(d), L = Math.hypot(p.dx,p.dy) || 1, ux = p.dx/L, uy = p.dy/L;
-      const px = -uy, py = ux;
-      ctx.beginPath();
-      ctx.moveTo(p.x - ux*10*zk + px*7*zk, p.y - uy*10*zk + py*7*zk);
-      ctx.lineTo(p.x, p.y);
-      ctx.lineTo(p.x - ux*10*zk - px*7*zk, p.y - uy*10*zk - py*7*zk);
-      ctx.stroke();
+    const span = shown - sCar;
+    if (span > 8*zk){
+      const N = Math.max(16, Math.min(90, Math.round(span / (14*zk))));
+      const stepD = span / N;
+      const pts = [];
+      for (let i=0;i<=N;i++) pts.push(at(sCar + i*stepD));
+      /* 沿弧长的渐变:车头实 → 远端透明 */
+      const end = at(shown - 0.5), st = at(sCar + 0.5);
+      const grad = ctx.createLinearGradient(st.x, st.y, end.x, end.y);
+      /* 三层嵌套带宽,叠出柔边(无硬轮廓) */
+      const bands = [
+        { hw: 17*zk, a: 0.10, c1:'88,168,244', c2:'88,168,244' },
+        { hw: 11*zk, a: 0.20, c1:'96,176,246', c2:'96,176,246' },
+        { hw: 5.5*zk, a: 0.42, c1:'170,216,252', c2:'150,200,248' }
+      ];
+      for (const B of bands){
+        grad.addColorStop(0,   'rgba(' + B.c1 + ',' + B.a.toFixed(3) + ')');
+        grad.addColorStop(0.22,'rgba(' + B.c1 + ',' + (B.a*0.82).toFixed(3) + ')');
+        grad.addColorStop(0.6, 'rgba(' + B.c2 + ',' + (B.a*0.34).toFixed(3) + ')');
+        grad.addColorStop(1,   'rgba(' + B.c2 + ',0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        /* 左侧偏移 */
+        for (let i=0;i<pts.length;i++){
+          const p = pts[i], q = pts[Math.min(i+1, pts.length-1)], r0 = pts[Math.max(i-1, 0)];
+          let tx = q.x - r0.x, ty = q.y - r0.y;
+          const tl = Math.hypot(tx,ty) || 1; tx /= tl; ty /= tl;
+          const nx = -ty, ny = tx;
+          const x = p.x + nx*B.hw, y = p.y + ny*B.hw;
+          i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+        }
+        /* 右侧偏移(回程) */
+        for (let i=pts.length-1;i>=0;i--){
+          const p = pts[i], q = pts[Math.min(i+1, pts.length-1)], r0 = pts[Math.max(i-1, 0)];
+          let tx = q.x - r0.x, ty = q.y - r0.y;
+          const tl = Math.hypot(tx,ty) || 1; tx /= tl; ty /= tl;
+          const nx = -ty, ny = tx;
+          ctx.lineTo(p.x - nx*B.hw, p.y - ny*B.hw);
+        }
+        ctx.closePath(); ctx.fill();
+      }
     }
   } else {
     /* 绿色实线 + 轻辉光 */
@@ -4320,7 +4318,7 @@ btnResetStart.addEventListener('click', () => {
   cam.x = start.x; cam.y = start.y;
   actionText('小车已回到起点');
 });
-window.addEventListener('resize', () => { resizeCanvas(); layout(); });
+window.addEventListener('resize', resizeCanvas);
 } /* end !IS_WORKER 输入区 */
 
 /* ============ Worker 入口(仅 Worker 线程) ============ */
@@ -4427,7 +4425,6 @@ generateObstacles(0.12);
 grid.buildFromWorld();
 setupWorkers();
 updateCoverDisplay();
-layout();
 renderMetrics(); /* 初始即显示空态提示 */
 syncPlaybackUI();
 syncMoveGate();
