@@ -112,6 +112,7 @@ const COLORS = {
   bg:'#f7f8fa', outside:'#e8eaee', worldBorder:'#d0d4da', gridLine:'#eef0f4',
   obstacle:'#c8ccd4', obstacleEdge:'#9aa0aa',
   open:'#ffd166', closed:'#b8c4d8', current:'#ff8a5c',
+  backOpen:'#e2b3f5', backClosed:'#b98ad6',
   edge:'#9fb4d8', tree:'#9fb4d8', rewire:'#a06cd5', replan:'#e5b8f5',
   sample:'#7aa2f7', traj:'#8fd0c8',
   path:'#2f9e6e', start:'#2f6fd8', goal:'#e11d48',
@@ -132,6 +133,14 @@ const ALGORITHMS = [
   { id:'rrtconnect', name:'RRT-Connect' },
   { id:'vgraph',   name:'可见性图' },
   { id:'aco',      name:'蚁群算法' },
+  { id:'theta',    name:'Theta* 任意角' },
+  { id:'bidir',    name:'双向 A*' },
+  { id:'ara',      name:'ARA* 随时修复' },
+  { id:'beam',     name:'束搜索 Beam' },
+  { id:'prmstar',  name:'PRM*' },
+  { id:'fmt',      name:'FMT* 快速行进树' },
+  { id:'informedrrt', name:'Informed RRT*' },
+  { id:'rrtsmart', name:'RRT*-Smart' },
 ];
 
 /* ============ DOM ============ */
@@ -153,6 +162,7 @@ const start = { x: W/2, y: H/2, theta: 0 };
 const goal = { x: W-160, y: H-160 };
 const car = { x: start.x, y: start.y, theta: 0, v: 0, delta: 0, collided: false };
 let mode = 'idle', algo = null, running = false, dliteDirty = false;
+let APF_SPEED = 120; /* 势场法推进速度:Worker 无 DOM,由主线程随 start 消息下发 */
 let algId = 'astar', pathMode = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
 let selectedObstacle = null;
@@ -162,7 +172,8 @@ function algoStart(){ return dynamicStart || start; }
 let lastT = performance.now(), acc = 0, lastMetricsRender = 0;
 let vw = 0, vh = 0;
 const vis = IS_WORKER ? mkWorkerVis() : {
-  openCells:new Map(), closedCells:new Map(), current:null,
+  openCells:new Map(), closedCells:new Map(),
+  backOpen:new Map(), backClosed:new Map(), current:null,
   edges:[], samples:[], replanCells:new Map(), trajs:[],
   path:[], force:null, prmOpen:new Map(), prmClosed:new Map()
 };
@@ -410,6 +421,10 @@ function mkWorkerVis(){
     get(t,p){
       if (p==='clear') return () => { t.clear(); inc.push(['mc',name]); };
       if (p==='size') return t.size;
+      /* Map 方法必须显式包装:否则 vis.openCells.set(...) 经 get trap 取到原生 Map#set,
+         绕过 set trap → 增量不记录(open/closed 色块永远看不到) */
+      if (p==='set') return (k,v) => { t.set(k,v); inc.push(['ms',name,k,v]); return t; };
+      if (p==='delete') return (k) => { const had=t.has(k); t.delete(k); if(had) inc.push(['md',name,k]); return had; };
       const v=t[p]; return typeof v==='function' ? v.bind(t) : v;
     }
   });
@@ -429,7 +444,8 @@ function mkWorkerVis(){
     });
   };
   const vis = {
-    openCells: mkMap('openCells'), closedCells: mkMap('closedCells'), current:null,
+    openCells: mkMap('openCells'), closedCells: mkMap('closedCells'),
+    backOpen: mkMap('backOpen'), backClosed: mkMap('backClosed'), current:null,
     edges: mkArr('edges'), samples: [], replanCells: mkMap('replanCells'), trajs: mkArr('trajs'),
     path: mkArr('path'), force:null, prmOpen: mkMap('prmOpen'), prmClosed: mkMap('prmClosed')
   };
@@ -448,7 +464,8 @@ function mkWorkerVis(){
   return root;
 }
 function visReset(){
-  vis.openCells.clear(); vis.closedCells.clear(); vis.current=null;
+  vis.openCells.clear(); vis.closedCells.clear();
+  vis.backOpen.clear(); vis.backClosed.clear(); vis.current=null;
   vis.edges.length=0; vis.samples.length=0; vis.replanCells.clear(); vis.trajs.length=0;
   vis.path.length=0; vis.force=null; vis.prmOpen.clear(); vis.prmClosed.clear();
 }
@@ -1018,7 +1035,7 @@ function createAPF(){
       const oldX = p.x, oldY = p.y;
       if (fRaw > 1e-6){
         const nx = fx/fRaw, ny = fy/fRaw;
-        const spd = speedRange.value * Math.min(1, fRaw/0.15);
+        const spd = (IS_WORKER ? APF_SPEED : +speedRange.value) * Math.min(1, fRaw/0.15);
         p.x += nx*spd*0.05; p.y += ny*spd*0.05;
         p.v = spd;
         const tgt = Math.atan2(ny, nx);
@@ -1885,8 +1902,938 @@ function createACO(){
   return a;
 }
 
+
+/* ============ 网格 supercover 视线(线段穿过的每一格都须自由) ============ */
+function gridLineFree(a, b){
+  if (!grid.isFree(a) || !grid.isFree(b)) return false;
+  let x = a.x, y = a.y;
+  if (x === b.x && y === b.y) return true;
+  const x0 = x + 0.5, y0 = y + 0.5;
+  const dx = b.x - x, dy = b.y - y;
+  const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1;
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  let tMaxX = ax > 0 ? ((stepX > 0 ? (x + 1 - x0) : (x0 - x)) / ax) : Infinity;
+  let tMaxY = ay > 0 ? ((stepY > 0 ? (y + 1 - y0) : (y0 - y)) / ay) : Infinity;
+  const tDX = ax > 0 ? 1/ax : Infinity, tDY = ay > 0 ? 1/ay : Infinity;
+  const guard = ax + ay + 8;
+  for (let i=0;i<guard;i++){
+    if (tMaxX < tMaxY - 1e-12){ x += stepX; tMaxX += tDX; }
+    else if (tMaxY < tMaxX - 1e-12){ y += stepY; tMaxY += tDY; }
+    else {
+      if (!grid.isFree({ x:x+stepX, y }) || !grid.isFree({ x, y:y+stepY })) return false;
+      x += stepX; y += stepY; tMaxX += tDX; tMaxY += tDY;
+    }
+    if (!grid.isFree({ x, y })) return false;
+    if (x === b.x && y === b.y) return true;
+  }
+  return false;
+}
+/* 采样类算法的连接半径 r(n) ∝ sqrt(log n / n)(PRM-star/FMT-star 渐进最优理论) */
+function sampleRadius(n){
+  const gamma = 3.0*Math.sqrt(W*H*0.8/Math.PI);
+  return clamp(gamma*Math.sqrt(Math.log(n+1)/(n+1)), 150, 700);
+}
+/* 格点抖动采样:比纯随机更均匀,消除局部空洞(纯随机采样会让路图在角落断开) */
+function jitteredSampleCells(n){
+  const cols = Math.max(1, Math.ceil(Math.sqrt(n*W/H)));
+  const rows = Math.max(1, Math.ceil(n/cols));
+  const cw = W/cols, ch = H/rows;
+  const pts = [];
+  outer:
+  for (let r=0;r<rows;r++) for (let c=0;c<cols;c++){
+    if (pts.length >= n) break outer;
+    pts.push({ x:clamp((c+0.05+Math.random()*0.9)*cw, 1, W-1),
+               y:clamp((r+0.05+Math.random()*0.9)*ch, 1, H-1) });
+  }
+  pts.cell = Math.max(cw, ch);
+  return pts;
+}
+/* 点集空间桶:邻近查询免全对距离扫描 */
+function buildPointBuckets(pts, cell){
+  const b = new Map();
+  for (let i=0;i<pts.length;i++){
+    const k = Math.floor(pts[i].x/cell) + ',' + Math.floor(pts[i].y/cell);
+    let arr = b.get(k);
+    if (!arr){ arr = []; b.set(k, arr); }
+    arr.push(i);
+  }
+  return { b, cell };
+}
+function pointBucketNear(pb, p, rings, out, skipFn){
+  const seen = new Set();
+  for (let rad=0; rad<=rings; rad++){
+    const x0 = Math.floor((p.x-rad*pb.cell)/pb.cell), x1 = Math.floor((p.x+rad*pb.cell)/pb.cell);
+    const y0 = Math.floor((p.y-rad*pb.cell)/pb.cell), y1 = Math.floor((p.y+rad*pb.cell)/pb.cell);
+    for (let by=y0;by<=y1;by++) for (let bx=x0;bx<=x1;bx++){
+      const key = bx + ',' + by;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const arr = pb.b.get(key);
+      if (!arr) continue;
+      for (let t=0;t<arr.length;t++){ const i = arr[t]; if (skipFn && skipFn(i)) continue; out.push(i); }
+    }
+  }
+  return out;
+}
+/* 路径视线剪枝:贪心拉直(去掉多余折点) */
+function prunePath(pts){
+  if (!pts || pts.length < 3) return pts ? pts.slice() : [];
+  const out = [ pts[0] ];
+  let i = 0, guard = 0;
+  while (i < pts.length-1 && guard++ < 20000){
+    let j = pts.length-1;
+    while (j > i+1 && !segmentFree(pts[i], pts[j])) j--;
+    out.push(pts[j]); i = j;
+  }
+  return out;
+}
+
+/* ============ Theta*(任意角 A*:父节点即视线可达的祖先) ============ */
+function createThetaStar(){
+  const a = {
+    id:'theta', name:'Theta* 任意角', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.open = new MinHeap((x,y)=>x.f-y.f);
+      this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+      this.pops = 0; this.t0 = performance.now();
+      const s = this.startC, k = ck(s);
+      this.g.set(k, 0); this.parent.set(k, null);
+      this.open.push({ c:s, f:this.h(s) });
+      visReset();
+      vis.openCells.set(k, s);
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.open.size === 0){
+        this.done = true; this.failReason = '无可行路径(open 已空)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'Theta*:未找到路径' });
+        return events;
+      }
+      const node = this.open.pop();
+      const c = node.c, k = ck(c);
+      if (this.closed.has(k)) return events;
+      this.closed.add(k);
+      this.pops++;
+      vis.closedCells.set(k, c); vis.openCells.delete(k);
+      vis.current = grid.cellCenter(c);
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      if (k === ck(this.goalC)){
+        this.done = true;
+        this.path = this.buildPath();
+        this.metrics.pathLen = pathLen(this.path);
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'Theta*:到达终点,扩展 '+this.pops+' 格,路径 '+this.metrics.pathLen.toFixed(0)+'px(任意角,无格对齐)' });
+        return events;
+      }
+      const gk = this.g.get(k), pk = this.parent.get(k);
+      for (const nb of grid.neighbors8(c)){
+        const nk = ck(nb.c);
+        if (this.closed.has(nk)) continue;
+        let ng, np;
+        if (pk && gridLineFree(pk, nb.c)){ ng = this.g.get(ck(pk)) + this.d(pk, nb.c); np = pk; }
+        else { ng = gk + this.d(c, nb.c); np = c; }
+        const old = this.g.get(nk);
+        if (old === undefined || ng < old - 1e-6){
+          this.g.set(nk, ng); this.parent.set(nk, np);
+          this.open.push({ c:nb.c, f:ng + this.h(nb.c) });
+          if (old === undefined){
+            vis.openCells.set(nk, nb.c);
+            const pc = grid.cellCenter(np), cc = grid.cellCenter(c);
+            vis.edges.push({ x1:pc.x, y1:pc.y, x2:cc.x, y2:cc.y });
+          }
+        }
+      }
+      return events;
+    },
+    buildPath(){
+      const cells = [];
+      let cur = this.goalC, guard = 0;
+      while (cur && guard++ < 50000){
+        cells.unshift(cur);
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      const pts = cells.map(grid.cellCenter);
+      if (pts.length < 3) return pts;
+      const out = [ pts[0] ];
+      let i = 0, g2 = 0;
+      while (i < pts.length-1 && g2++ < 20000){
+        let j = pts.length-1;
+        while (j > i+1 && !gridLineFree(grid.cellAt(pts[i].x,pts[i].y), grid.cellAt(pts[j].x,pts[j].y))) j--;
+        out.push(pts[j]); i = j;
+      }
+      return out;
+    }
+  };
+  return a;
+}
+
+/* ============ 双向 A*(起点/终点两侧交替扩展,相遇拼接) ============ */
+function createBidirectionalAstar(){
+  const a = {
+    id:'bidir', name:'双向 A*', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c, t){ return Math.hypot(c.x-t.x, c.y-t.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.openF = new MinHeap((x,y)=>x.f-y.f);
+      this.openB = new MinHeap((x,y)=>x.f-y.f);
+      this.gF = new Map(); this.gB = new Map();
+      this.parentF = new Map(); this.parentB = new Map();
+      this.closedF = new Set(); this.closedB = new Set();
+      this.best = Infinity; this.meetC = null;
+      this.pops = 0; this.turn = 0; this.t0 = performance.now();
+      const ks = ck(this.startC), kg = ck(this.goalC);
+      this.gF.set(ks, 0); this.parentF.set(ks, null);
+      this.gB.set(kg, 0); this.parentB.set(kg, null);
+      this.openF.push({ c:this.startC, f:this.h(this.startC, this.goalC) });
+      this.openB.push({ c:this.goalC, f:this.h(this.goalC, this.startC) });
+      visReset();
+      vis.openCells.set(ks, this.startC);
+      vis.backOpen.set(kg, this.goalC);
+      if (ks === kg){ this.best = 0; this.meetC = this.startC; }
+      return true;
+    },
+    expand(side){
+      const fwd = side === 0;
+      const open = fwd ? this.openF : this.openB;
+      const closed = fwd ? this.closedF : this.closedB;
+      const g = fwd ? this.gF : this.gB;
+      const otherG = fwd ? this.gB : this.gF;
+      const parent = fwd ? this.parentF : this.parentB;
+      if (open.size === 0) return;
+      const c = open.pop().c, k = ck(c);
+      if (closed.has(k)) return; /* 过期堆项:节点已闭合 */
+      closed.add(k);
+      this.pops++;
+      if (fwd){ vis.closedCells.set(k, c); vis.openCells.delete(k); }
+      else { vis.backClosed.set(k, c); vis.backOpen.delete(k); }
+      vis.current = grid.cellCenter(c);
+      const gk = g.get(k);
+      const oc = otherG.get(k);
+      if (oc !== undefined && gk + oc < this.best){ this.best = gk + oc; this.meetC = c; }
+      const tgt = fwd ? this.goalC : this.startC;
+      for (const nb of grid.neighbors8(c)){
+        const nk = ck(nb.c);
+        const ng = gk + this.d(c, nb.c);
+        const old = g.get(nk);
+        if (old === undefined || ng < old - 1e-6){
+          g.set(nk, ng); parent.set(nk, c);
+          open.push({ c:nb.c, f:ng + this.h(nb.c, tgt) });
+          if (fwd) vis.openCells.set(nk, nb.c); else vis.backOpen.set(nk, nb.c);
+          const onb = otherG.get(nk);
+          if (onb !== undefined && ng + onb < this.best){ this.best = ng + onb; this.meetC = nb.c; }
+        }
+      }
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+    },
+    step(){
+      const events = [];
+      const pf = this.openF.size ? this.openF.peek().f : Infinity;
+      const pb = this.openB.size ? this.openB.peek().f : Infinity;
+      if (this.best < Infinity && (pf + pb >= this.best || !this.openF.size || !this.openB.size)){
+        this.done = true;
+        this.path = this.buildPath();
+        this.metrics.pathLen = pathLen(this.path);
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'双向 A*:两侧相遇,扩展 '+this.pops+' 格,路径 '+this.metrics.pathLen.toFixed(0)+'px' });
+        return events;
+      }
+      if (!this.openF.size && !this.openB.size){
+        this.done = true; this.failReason = '无可行路径(双向 open 已空)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'双向 A*:未找到路径' });
+        return events;
+      }
+      this.expand(this.turn);
+      this.turn ^= 1;
+      return events;
+    },
+    buildPath(){
+      if (!this.meetC) return [];
+      const fwd = [];
+      let cur = this.meetC, guard = 0;
+      while (cur && guard++ < 50000){
+        fwd.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parentF.get(ck(cur));
+      }
+      const bwd = [];
+      cur = this.meetC; guard = 0;
+      while (cur && guard++ < 50000){
+        bwd.push(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.goalC)) break;
+        cur = this.parentB.get(ck(cur));
+      }
+      return fwd.concat(bwd.slice(1));
+    }
+  };
+  return a;
+}
+
+/* ============ ARA*(Anytime Repairing A*:ε 逐轮收紧,先快后精) ============ */
+function createARA(){
+  const a = {
+    id:'ara', name:'ARA* 随时修复', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.g = new Map(); this.parent = new Map();
+      this.closed = new Set(); this.incons = new Set(); this.inOpen = new Set();
+      this.eps = 3; this.MIN_EPS = 1;
+      this.t0 = performance.now(); this.pops = 0;
+      this.open = new MinHeap((x,y)=>x.f-y.f);
+      const k = ck(this.startC);
+      this.g.set(k, 0); this.parent.set(k, null);
+      this.open.push({ c:this.startC, f:this.eps*this.h(this.startC), g:0 });
+      this.inOpen.add(k);
+      visReset();
+      vis.openCells.set(k, this.startC);
+      return true;
+    },
+    cellOfKey(k){ const p = k.split(','); return { x:+p[0], y:+p[1] }; },
+    goalG(){ const v = this.g.get(ck(this.goalC)); return v === undefined ? Infinity : v; },
+    popValid(){
+      while (this.open.size){
+        const node = this.open.pop();
+        const k = ck(node.c);
+        this.inOpen.delete(k);
+        const gv = this.g.get(k);
+        if (gv !== undefined && Math.abs(node.g - gv) < 1e-6) return node;
+      }
+      return null;
+    },
+    step(){
+      const events = [];
+      const gg = this.goalG();
+      const top = this.open.size ? this.open.peek() : null;
+      /* 本轮结束:open 空 或 最小 key 已不小于终点代价(标准 ARA* 终止条件) */
+      if (!top || (gg < Infinity && top.f >= gg - 1e-9)){
+        if (gg < Infinity){
+          this.path = this.buildPath();
+          this.metrics.pathLen = pathLen(this.path);
+          events.push({ type:'info', text:'ARA*: ε='+this.eps.toFixed(2)+' 可用路径 '+this.metrics.pathLen.toFixed(0)+'px' });
+        }
+        if (this.eps <= this.MIN_EPS + 1e-9){
+          this.done = true;
+          this.metrics.timeMs = performance.now()-this.t0;
+          if (!this.path.length){
+            this.failReason = '无可行路径';
+            events.push({ type:'info', text:'ARA*:未找到路径' });
+          } else {
+            events.push({ type:'info', text:'ARA*:收敛于 ε=1(最优),路径 '+this.metrics.pathLen.toFixed(0)+'px,扩展 '+this.pops+' 格' });
+          }
+          return events;
+        }
+        this.eps = Math.max(this.MIN_EPS, this.eps*0.6);
+        for (const k of this.incons){
+          const c = this.cellOfKey(k);
+          this.open.push({ c, f:this.g.get(k)+this.eps*this.h(c), g:this.g.get(k) });
+          this.inOpen.add(k);
+          vis.openCells.set(k, c);
+        }
+        this.incons.clear();
+        events.push({ type:'info', text:'ARA*:收紧 ε → '+this.eps.toFixed(2)+',继续改进…' });
+        return events;
+      }
+      const node = this.popValid();
+      if (!node) return events;
+      const c = node.c, k = ck(c);
+      this.pops++;
+      this.closed.add(k);
+      vis.closedCells.set(k, c); vis.openCells.delete(k);
+      vis.current = grid.cellCenter(c);
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      const gk = this.g.get(k);
+      for (const nb of grid.neighbors8(c)){
+        const nk = ck(nb.c);
+        const ng = gk + this.d(c, nb.c);
+        const old = this.g.get(nk);
+        if (old === undefined || ng < old - 1e-6){
+          this.g.set(nk, ng); this.parent.set(nk, c);
+          if (this.closed.has(nk)) this.incons.add(nk);
+          else {
+            /* g 改进即重新入堆(popValid 用 g 快照丢弃过期项);否则节点会以旧代价出堆 */
+            this.open.push({ c:nb.c, f:ng + this.eps*this.h(nb.c), g:ng });
+            if (!this.inOpen.has(nk)){ this.inOpen.add(nk); vis.openCells.set(nk, nb.c); }
+          }
+        }
+      }
+      return events;
+    },
+    buildPath(){
+      const pts = [];
+      let cur = this.goalC, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ 束搜索(每层只保留 h 最小的 BEAM 个节点) ============ */
+function createBeamSearch(){
+  const a = {
+    id:'beam', name:'束搜索 Beam', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y); },
+    init(){
+      grid.buildFromWorld();
+      this.startC = grid.cellAt(algoStart().x, algoStart().y);
+      this.goalC = grid.cellAt(goal.x, goal.y);
+      if (!grid.isFree(this.startC) || !grid.isFree(this.goalC)){ this.failReason='起点或终点被障碍物占据'; return false; }
+      this.BEAM = 32; this.attempt = 0;
+      this.t0 = performance.now();
+      this.reset();
+      return true;
+    },
+    reset(){
+      this.frontier = [ this.startC ];
+      this.visited = new Set([ ck(this.startC) ]);
+      this.parent = new Map(); this.parent.set(ck(this.startC), null);
+      this.depth = 0; this.pops = 0;
+      visReset();
+      vis.openCells.set(ck(this.startC), this.startC);
+    },
+    step(){
+      const events = [];
+      if (this.frontier.length === 0){
+        if (this.attempt < 1){
+          this.attempt++;
+          this.BEAM *= 8;
+          this.reset();
+          events.push({ type:'info', text:'束搜索:前沿枯竭,束宽放宽至 '+this.BEAM+' 重试…' });
+          return events;
+        }
+        this.done = true; this.failReason = '无可行路径(束宽不足)';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'束搜索:未找到路径(束宽 '+this.BEAM+')' });
+        return events;
+      }
+      const next = [];
+      let found = null;
+      for (const c of this.frontier){
+        const k = ck(c);
+        vis.closedCells.set(k, c); vis.openCells.delete(k);
+        vis.current = grid.cellCenter(c);
+        this.pops++;
+        for (const nb of grid.neighbors8(c)){
+          const nk = ck(nb.c);
+          if (this.visited.has(nk)) continue;
+          this.visited.add(nk);
+          this.parent.set(nk, c);
+          if (nk === ck(this.goalC)){ found = nb.c; break; }
+          next.push({ c:nb.c, h:this.h(nb.c) });
+        }
+        if (found) break;
+      }
+      this.depth++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      if (found){
+        this.done = true;
+        this.path = this.buildPath(found);
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'束搜索:到达终点,深度 '+this.depth+',扩展 '+this.pops+' 格,路径 '+this.metrics.pathLen.toFixed(0)+'px' });
+        return events;
+      }
+      /* 关键剪枝:非最优的 (next.length-BEAM) 个节点永久丢弃 → 内存恒定 O(BEAM·深度) */
+      next.sort((p,q)=>p.h-q.h);
+      this.frontier = next.slice(0, this.BEAM).map(o=>o.c);
+      for (const c of this.frontier) vis.openCells.set(ck(c), c);
+      events.push({ type:'info', text:'束搜索:深度 '+this.depth+',保留前沿 '+this.frontier.length+'/'+next.length });
+      return events;
+    },
+    buildPath(c){
+      const pts = [];
+      let cur = c, guard = 0;
+      while (cur && guard++ < 50000){
+        pts.unshift(grid.cellCenter(cur));
+        if (ck(cur) === ck(this.startC)) break;
+        cur = this.parent.get(ck(cur));
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ PRM*(渐进最优概率路图:r(n) 半径全连接) ============ */
+function createPRMStar(){
+  const a = {
+    id:'prmstar', name:'PRM*', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.phase = 'sample';
+      const s0 = algoStart();
+      this.samples = [ {x:s0.x,y:s0.y}, {x:goal.x,y:goal.y} ];
+      this.startIdx = 0; this.goalIdx = 1;
+      this.edges = []; this.adj = [];
+      this.N = 1200; this.MAXK = 24;
+      this.cells = jitteredSampleCells(this.N);
+      this.ci = 0; this.si = 0; this.pops = 0;
+      this.t0 = performance.now();
+      visReset();
+      vis.samples = this.samples;
+      return true;
+    },
+    step(){
+      const events = [];
+      if (this.phase === 'sample'){
+        for (let k=0;k<24 && this.ci < this.cells.length && this.samples.length < this.N+2;k++){
+          const p = this.cells[this.ci++];
+          if (pointFree(p.x,p.y)) this.samples.push(p);
+        }
+        this.metrics.expanded = this.samples.length;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.samples.length >= this.N+2 || this.ci >= this.cells.length){
+          this.adj = this.samples.map(() => new Set());
+          /* 理论半径 r(n) ∝ sqrt(log n/n) 与采样格距取大者,保证路图连通 */
+          this.r = Math.max(sampleRadius(this.samples.length), 1.4*this.cells.cell);
+          buildObstacleBuckets();
+          this.pb = buildPointBuckets(this.samples, 300);
+          this.phase = 'graph';
+          vis.samples = this.samples;
+          events.push({ type:'info', text:'PRM*:采样 '+this.samples.length+' 点,r(n)='+this.r.toFixed(0)+'px,半径全连接…' });
+        } else {
+          events.push({ type:'info', text:'PRM*:采样 '+this.samples.length+'/'+this.N });
+        }
+        return events;
+      }
+      if (this.phase === 'graph'){
+        if (this.si >= this.samples.length){
+          this.phase = 'search';
+          this.open = new MinHeap((x,y)=>x.f-y.f);
+          this.g = new Map(); this.parent = new Map(); this.closed = new Set();
+          this.g.set(this.startIdx, 0);
+          this.open.push({ i:this.startIdx, g:0, f:Math.hypot(this.samples[0].x-this.samples[1].x, this.samples[0].y-this.samples[1].y) });
+          events.push({ type:'info', text:'PRM*:路图完成('+this.edges.length+' 边),图上 A* 搜索…' });
+          return events;
+        }
+        const i = this.si, p = this.samples[i];
+        const r2 = this.r*this.r;
+        const raw = [];
+        pointBucketNear(this.pb, p, Math.ceil(this.r/300)+1, raw, xx => xx === i);
+        const cand = [];
+        const seen = new Set();
+        for (const j of raw){
+          if (seen.has(j)) continue;
+          seen.add(j);
+          const q = this.samples[j];
+          const dx = p.x-q.x, dy = p.y-q.y;
+          const dd = dx*dx+dy*dy;
+          if (dd > r2) continue;
+          cand.push([j, dd]);
+        }
+        cand.sort((x,y)=>x[1]-y[1]);
+        let added = 0;
+        for (let t=0;t<cand.length && added<this.MAXK;t++){
+          const j = cand[t][0];
+          if (this.adj[i].has(j)) continue;
+          if (!segmentFreeInfl(p, this.samples[j], obsBuckets)) continue;
+          this.adj[i].add(j); this.adj[j].add(i);
+          this.edges.push([i,j]);
+          added++;
+        }
+        this.si++;
+        this.metrics.expanded = this.samples.length;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.si % 50 === 0) events.push({ type:'info', text:'PRM*:连接 '+this.si+'/'+this.samples.length+' 点,'+this.edges.length+' 边' });
+        return events;
+      }
+      if (this.open.size === 0){
+        this.done = true; this.failReason = '图上无可行路径';
+        this.metrics.timeMs = performance.now()-this.t0;
+        events.push({ type:'info', text:'PRM*:图上无路径' });
+        return events;
+      }
+      const node = this.open.pop();
+      const i = node.i;
+      if (this.closed.has(i)) return events;
+      this.closed.add(i); this.pops++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      vis.prmClosed.set(i, this.samples[i]);
+      vis.prmOpen.delete(i);
+      vis.current = this.samples[i];
+      if (i === this.goalIdx){
+        this.done = true;
+        this.path = this.backtrace(i);
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'PRM*:找到路径,扩展 '+this.pops+' 节点,路径 '+this.metrics.pathLen.toFixed(0)+'px' });
+        return events;
+      }
+      for (const j of this.adj[i]){
+        if (this.closed.has(j)) continue;
+        const ng = node.g + Math.hypot(this.samples[i].x-this.samples[j].x, this.samples[i].y-this.samples[j].y);
+        const old = this.g.get(j);
+        if (old === undefined || ng < old - 1e-6){
+          this.g.set(j, ng); this.parent.set(j, i);
+          this.open.push({ i:j, g:ng, f:ng+Math.hypot(this.samples[j].x-this.samples[this.goalIdx].x, this.samples[j].y-this.samples[this.goalIdx].y) });
+          vis.prmOpen.set(j, this.samples[j]);
+        }
+      }
+      return events;
+    },
+    backtrace(i){
+      const pts = [];
+      let cur = i, guard = 0;
+      while (cur !== undefined && guard++ < 50000){
+        pts.unshift(this.samples[cur]);
+        if (cur === this.startIdx) break;
+        cur = this.parent.get(cur);
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ FMT*(快速行进树:采样 + 惰性动态规划波前) ============ */
+function createFMT(){
+  const a = {
+    id:'fmt', name:'FMT* 快速行进树', done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      this.phase = 'sample';
+      const s0 = algoStart();
+      this.samples = [ {x:s0.x,y:s0.y}, {x:goal.x,y:goal.y} ];
+      this.startIdx = 0; this.goalIdx = 1;
+      this.edges = [];
+      this.N = 1500; this.K = 16; this.TB = 300;
+      this.cells = jitteredSampleCells(this.N);
+      this.ci = 0; this.pops = 0; this.jumps = 0;
+      this.t0 = performance.now();
+      visReset();
+      vis.samples = this.samples;
+      return true;
+    },
+    treeBucketAdd(i){
+      const p = this.samples[i];
+      const k = Math.floor(p.x/this.TB) + ',' + Math.floor(p.y/this.TB);
+      let arr = this.tb.get(k);
+      if (!arr){ arr = []; this.tb.set(k, arr); }
+      arr.push(i);
+    },
+    nearTree(p, K){
+      /* 树节点空间桶逐圈扩展取最近邻(免全树扫描) */
+      const out = [];
+      const seen = this.seenB;
+      seen.clear();
+      const TB = this.TB;
+      for (let rad=0; rad<9 && out.length < K; rad++){
+        const x0 = Math.floor((p.x-rad*TB)/TB), x1 = Math.floor((p.x+rad*TB)/TB);
+        const y0 = Math.floor((p.y-rad*TB)/TB), y1 = Math.floor((p.y+rad*TB)/TB);
+        for (let by=y0;by<=y1;by++) for (let bx=x0;bx<=x1;bx++){
+          const key = bx + ',' + by;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const arr = this.tb.get(key);
+          if (!arr) continue;
+          for (let t=0;t<arr.length;t++){ out.push(arr[t]); if (out.length >= K) return out; }
+        }
+      }
+      return out;
+    },
+    step(){
+      const events = [];
+      if (this.phase === 'sample'){
+        for (let k=0;k<24 && this.ci < this.cells.length && this.samples.length < this.N+2;k++){
+          const p = this.cells[this.ci++];
+          if (pointFree(p.x,p.y)) this.samples.push(p);
+        }
+        this.metrics.expanded = this.samples.length;
+        this.metrics.timeMs = performance.now()-this.t0;
+        if (this.samples.length >= this.N+2 || this.ci >= this.cells.length){
+          this.r = Math.max(sampleRadius(this.samples.length), 1.4*this.cells.cell);
+          buildObstacleBuckets();
+          this.pb = buildPointBuckets(this.samples, 300);
+          this.tb = new Map(); this.seenB = new Set();
+          this.tree = [ this.startIdx ];
+          this.parent = new Map();
+          this.cost = new Map([[this.startIdx, 0]]);
+          this.unvisited = new Set();
+          for (let i=0;i<this.samples.length;i++) if (i !== this.startIdx) this.unvisited.add(i);
+          this.z = this.startIdx;
+          this.treeBucketAdd(this.startIdx);
+          this.phase = 'wave';
+          vis.samples = this.samples;
+          vis.prmClosed.set(this.startIdx, this.samples[this.startIdx]);
+          events.push({ type:'info', text:'FMT*:采样 '+this.samples.length+' 点,r='+this.r.toFixed(0)+'px,惰性动态规划波前…' });
+        } else {
+          events.push({ type:'info', text:'FMT*:采样 '+this.samples.length+'/'+this.N });
+        }
+        return events;
+      }
+      const z = this.z, p = this.samples[z];
+      const r2 = this.r*this.r;
+      const raw = [];
+      pointBucketNear(this.pb, p, Math.ceil(this.r/300)+1, raw, xx => !this.unvisited.has(xx));
+      const cand = [];
+      const seen = new Set();
+      for (const j of raw){
+        if (seen.has(j)) continue;
+        seen.add(j);
+        const q = this.samples[j];
+        const dx = p.x-q.x, dy = p.y-q.y;
+        const dd = dx*dx+dy*dy;
+        if (dd > r2) continue;
+        cand.push([j, dd]);
+      }
+      cand.sort((x,y)=>x[1]-y[1]);
+      const limit = Math.min(cand.length, 30);
+      let bestX = -1, bestC = Infinity, bestY = -1;
+      for (let t=0;t<limit;t++){
+        const x = cand[t][0], q = this.samples[x];
+        let bc = Infinity, by = -1;
+        const tn = this.nearTree(q, this.K);
+        for (let ti=0;ti<tn.length;ti++){
+          const y = tn[ti];
+          const cy = this.cost.get(y);
+          if (cy === undefined || cy >= bc) continue;
+          const d = Math.hypot(this.samples[y].x-q.x, this.samples[y].y-q.y);
+          if (cy + d >= bc) continue;
+          if (!segmentFreeInfl(this.samples[y], q, obsBuckets)) continue;
+          bc = cy + d; by = y;
+        }
+        if (by >= 0 && bc < bestC){ bestC = bc; bestX = x; bestY = by; }
+      }
+      if (bestX < 0){
+        /* 波前局部枯竭:跳到最近的未访问点,保证搜索继续前进 */
+        let nx = -1, nd = Infinity;
+        for (const x of this.unvisited){
+          const q = this.samples[x];
+          const d = (q.x-p.x)*(q.x-p.x) + (q.y-p.y)*(q.y-p.y);
+          if (d < nd){ nd = d; nx = x; }
+        }
+        if (nx < 0){
+          this.done = true; this.failReason = '无可行路径(未访问集已空)';
+          this.metrics.timeMs = performance.now()-this.t0;
+          events.push({ type:'info', text:'FMT*:未找到路径' });
+          return events;
+        }
+        this.z = nx; this.jumps++;
+        return events;
+      }
+      this.parent.set(bestX, bestY);
+      this.cost.set(bestX, bestC);
+      this.tree.push(bestX);
+      this.unvisited.delete(bestX);
+      this.edges.push([bestY, bestX]);
+      this.treeBucketAdd(bestX);
+      vis.prmClosed.set(z, this.samples[z]);
+      vis.prmOpen.set(bestX, this.samples[bestX]);
+      this.z = bestX;
+      this.pops++;
+      this.metrics.expanded = this.pops;
+      this.metrics.timeMs = performance.now()-this.t0;
+      vis.current = this.samples[bestX];
+      if (bestX === this.goalIdx){
+        this.done = true;
+        this.path = this.backtrace(this.goalIdx);
+        this.metrics.pathLen = pathLen(this.path);
+        events.push({ type:'info', text:'FMT*:到达终点,'+this.pops+' 次波前扩展,路径 '+this.metrics.pathLen.toFixed(0)+'px'+(this.jumps?',跳跃 '+this.jumps+' 次':'') });
+        return events;
+      }
+      if (this.pops % 150 === 0) events.push({ type:'info', text:'FMT*:波前 '+this.pops+' 步,树 '+this.tree.length+' 点' });
+      return events;
+    },
+    backtrace(i){
+      const pts = [];
+      let cur = i, guard = 0;
+      while (cur !== undefined && guard++ < 50000){
+        pts.unshift(this.samples[cur]);
+        if (cur === this.startIdx) break;
+        cur = this.parent.get(cur);
+      }
+      return pts;
+    }
+  };
+  return a;
+}
+
+/* ============ Informed RRT* / RRT*-Smart(采样式渐进优化) ============ */
+function createRRTStarVariant(kind){
+  const informed = kind === 'informed';
+  const name = informed ? 'Informed RRT*' : 'RRT*-Smart';
+  const MAX_ITER = 20000;              /* 初始解阶段安全阀(寻解极慢时兜底) */
+  const OPT_ITER = informed ? 3000 : 2200; /* 找到初始解后的优化迭代预算 */
+  const a = {
+    id: informed ? 'informedrrt' : 'rrtsmart', name, done:false, path:[], replanRun:false, failReason:'',
+    metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
+    init(){
+      const s0 = algoStart();
+      this.s0 = s0;
+      this.nodes = [ { x:s0.x, y:s0.y, parent:-1, cost:0 } ];
+      this.edges = [];
+      this.iter = 0; this.MAX_ITER = MAX_ITER; this.OPT_ITER = OPT_ITER; this.solvedIter = -1;
+      this.cBest = Infinity;
+      this.cMin = Math.hypot(goal.x-s0.x, goal.y-s0.y);
+      this.bestIdx = -1;
+      this.pathPts = null;
+      this.t0 = performance.now();
+      visReset();
+      return true;
+    },
+    backtrace(idx){
+      const pts = [];
+      let i = idx, guard = 0;
+      while (i >= 0 && guard++ < 50000){
+        const n = this.nodes[i];
+        pts.unshift({ x:n.x, y:n.y });
+        if (i === 0) break;
+        i = n.parent;
+      }
+      return pts;
+    },
+    refreshPath(){
+      const pts = this.backtrace(this.bestIdx);
+      pts.push({ x:goal.x, y:goal.y });
+      this.pathPts = pts;
+    },
+    sampleUniform(){ return { x:Math.random()*W, y:Math.random()*H }; },
+    sampleEllipse(){
+      /* 以起点/终点为焦点的椭圆:长轴 = 当前最优代价(Informed RRT* 的核心) */
+      const cB = this.cBest;
+      const a1 = cB/2;
+      const b1 = Math.sqrt(Math.max(0, cB*cB - this.cMin*this.cMin))/2;
+      const cx = (this.s0.x+goal.x)/2, cy = (this.s0.y+goal.y)/2;
+      const th = Math.atan2(goal.y-this.s0.y, goal.x-this.s0.x);
+      let ux = 0, uy = 0, guard = 0;
+      do { ux = Math.random()*2-1; uy = Math.random()*2-1; } while (ux*ux+uy*uy > 1 && guard++ < 50);
+      const co = Math.cos(th), si = Math.sin(th);
+      return { x:cx + co*ux*a1 - si*uy*b1, y:cy + si*ux*a1 + co*uy*b1 };
+    },
+    sample(){
+      /* 25% 目标偏置:大地图上纯随机采样几乎无法碰到终点 */
+      if (Math.random() < 0.25) return { x:goal.x, y:goal.y };
+      if (informed){
+        return (isFinite(this.cBest) && this.cBest > this.cMin + 1) ? this.sampleEllipse() : this.sampleUniform();
+      }
+      /* RRT*-Smart:有解后 60% 概率沿当前最优路径扰动采样(视觉节点) */
+      if (this.pathPts && Math.random() < 0.6){
+        const p = this.pathPts[Math.floor(Math.random()*this.pathPts.length)];
+        const ang = Math.random()*Math.PI*2, rr = Math.random()*RRT_STEP*3;
+        return { x: clamp(p.x + Math.cos(ang)*rr, 0, W), y: clamp(p.y + Math.sin(ang)*rr, 0, H) };
+      }
+      return this.sampleUniform();
+    },
+    step(){
+      const events = [];
+      /* 收敛:安全阀耗尽 / 找到解后已用满优化预算 / 已逼近直线下界 */
+      if (this.iter >= this.MAX_ITER ||
+          (this.bestIdx >= 0 && (this.iter >= this.solvedIter + this.OPT_ITER || this.cBest <= this.cMin*1.005 + 2))){
+        this.finish(events); return events;
+      }
+      for (let k=0;k<4 && this.iter < this.MAX_ITER;k++){
+        this.iter++;
+        const s = this.sample();
+        if (s.x < 0 || s.x > W || s.y < 0 || s.y > H) continue;
+        let ni = 0, bd = Infinity;
+        for (let i=0;i<this.nodes.length;i++){
+          const dx = this.nodes[i].x-s.x, dy = this.nodes[i].y-s.y, dd = dx*dx+dy*dy;
+          if (dd < bd){ bd = dd; ni = i; }
+        }
+        const near = this.nodes[ni], dn = Math.sqrt(bd);
+        let px, py;
+        if (dn <= RRT_STEP){ px = s.x; py = s.y; }
+        else { px = near.x + (s.x-near.x)/dn*RRT_STEP; py = near.y + (s.y-near.y)/dn*RRT_STEP; }
+        if (!pointFree(px, py)) continue;
+        const nn = { x:px, y:py, parent:-1, cost:0 };
+        /* 标准 RRT* choose-parent:在 REWIRE_R 邻域内选"可无碰撞连接且代价最小"的近邻,
+           最近邻连线被障碍挡住时改用其他近邻(否则该次迭代直接作废,树几乎不长) */
+        const cand = [];
+        for (let i=0;i<this.nodes.length;i++){
+          const dd = Math.hypot(px-this.nodes[i].x, py-this.nodes[i].y);
+          if (dd <= REWIRE_R) cand.push([i, dd]);
+        }
+        cand.sort((a,b)=>a[1]-b[1]);
+        let best = -1, bestCost = Infinity;
+        for (let t=0;t<cand.length;t++){
+          const i = cand[t][0], dd = cand[t][1];
+          const cc = this.nodes[i].cost + dd;
+          if (cc >= bestCost) continue;
+          if (!segmentFree(this.nodes[i], nn)) continue;
+          bestCost = cc; best = i;
+        }
+        if (best < 0) continue;
+        nn.parent = best; nn.cost = bestCost;
+        this.nodes.push(nn);
+        const idx = this.nodes.length-1;
+        this.edges.push({ a:nn.parent, b:idx, kind:'new' });
+        let rewired = 0;
+        for (let i=0;i<idx;i++){
+          if (i === nn.parent) continue;
+          const dd = Math.hypot(px-this.nodes[i].x, py-this.nodes[i].y);
+          if (dd > REWIRE_R || nn.cost + dd >= this.nodes[i].cost - 1e-9) continue;
+          if (!segmentFree(nn, this.nodes[i])) continue;
+          this.nodes[i].parent = idx; this.nodes[i].cost = nn.cost + dd;
+          this.edges.push({ a:idx, b:i, kind:'rewire' });
+          rewired++;
+        }
+        const dg = Math.hypot(goal.x-px, goal.y-py);
+        if (nn.cost + dg < this.cBest && segmentFree(nn, { x:goal.x, y:goal.y })){
+          this.cBest = nn.cost + dg;
+          this.bestIdx = idx;
+          if (this.solvedIter < 0) this.solvedIter = this.iter;
+          this.refreshPath();
+          events.push({ type:'info', text:name+':第 '+this.iter+' 次迭代找到更优路径 '+this.cBest.toFixed(0)+'px' });
+        } else if (rewired && this.iter % 60 === 0){
+          events.push({ type:'info', text:name+':迭代 '+this.iter+'/'+this.MAX_ITER+',节点 '+this.nodes.length+',重连 '+rewired });
+        }
+      }
+      this.metrics.expanded = this.nodes.length;
+      this.metrics.timeMs = performance.now()-this.t0;
+      return events;
+    },
+    finish(events){
+      this.done = true;
+      this.metrics.expanded = this.nodes.length;
+      this.metrics.timeMs = performance.now()-this.t0;
+      if (this.bestIdx < 0){
+        this.failReason = '未找到可行路径';
+        events.push({ type:'info', text:name+':'+this.failReason });
+        return;
+      }
+      const pts = this.backtrace(this.bestIdx);
+      pts.push({ x:goal.x, y:goal.y });
+      this.path = prunePath(pts);
+      this.metrics.pathLen = pathLen(this.path);
+      events.push({ type:'info', text:name+':收敛,'+this.iter+' 次迭代,'+this.nodes.length+' 节点,路径 '+this.metrics.pathLen.toFixed(0)+'px' });
+    }
+  };
+  return a;
+}
+function createInformedRRT(){ return createRRTStarVariant('informed'); }
+function createRRTSmart(){ return createRRTStarVariant('smart'); }
+
 /* ============ Worker 并行搜索(主线程侧) ============ */
-const COMPETE_IDS = new Set(['rrt','rrtstar','rrtconnect','prm','aco','apf']);
+const COMPETE_IDS = new Set(['rrt','rrtstar','rrtconnect','prm','aco','apf','prmstar','fmt','informedrrt','rrtsmart']);
 let workerOk = false, worker1 = null, competeWorkers = [], pendingBatches = [];
 let workerSrcCache = null;
 function mkSearchWorker(){
@@ -1933,7 +2880,8 @@ function applyInc(inc){
 }
 function handleWorkerMsg(src, m){
   if (src > 0){
-    /* 竞争 worker:只取先完成的路径 */
+    /* 竞争 worker:只取先完成的"成功"路径(失败结果不抢占,等主 worker 定论) */
+    if (m.type === 'done' && (!m.path || !m.path.length)) return;
     if (m.type === 'done' && algo && !algo.done){
       algo.done = true; algo.path = m.path || []; algo.failReason = m.failReason || '';
       algo.metrics = m.metrics || algo.metrics; algo.replanRun = !!m.replanRun; algo.hasPlan = !!m.hasPlan;
@@ -2004,7 +2952,8 @@ function postWorkerStart(params){
   if (!worker1){ workerOk = false; return; } /* Worker 异常 → 回退同步路径 */
   worker1.onmessage = (e) => handleWorkerMsg(0, e.data);
   const startMsg = (seed) => ({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
-    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed, speedMult: speedMult });
+    goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed, speedMult: speedMult,
+    apfSpeed: +speedRange.value });
   worker1.postMessage(startMsg(1));
   if (COMPETE_IDS.has(params.algoId)){
     /* 4 worker 竞争(不同随机种子):多核并行,先完成者胜 */
@@ -2048,6 +2997,14 @@ function createAlgorithm(id){
     case 'rrtconnect': return createRRTConnect();
     case 'vgraph': return createVGraph();
     case 'aco': return createACO();
+    case 'theta': return createThetaStar();
+    case 'bidir': return createBidirectionalAstar();
+    case 'ara': return createARA();
+    case 'beam': return createBeamSearch();
+    case 'prmstar': return createPRMStar();
+    case 'fmt': return createFMT();
+    case 'informedrrt': return createInformedRRT();
+    case 'rrtsmart': return createRRTSmart();
   }
   return createGridSearch('astar');
 }
@@ -2530,6 +3487,10 @@ function doReplan(){
   actionText('D* Lite:增量重规划…');
 }
 
+/* 采样类渲染分组(按算法族而非逐个 id 判断) */
+const SAMPLE_GRAPH_IDS = new Set(['prm','prmstar','fmt','vgraph']);
+const RRT_TREE_IDS = new Set(['rrt','rrtstar','informedrrt','rrtsmart']);
+
 /* ============ 指标面板 ============ */
 function renderMetrics(){
   let html = '<div class="m-head"><span>算法</span><span>长度(px)</span><span>扩展</span><span>耗时</span><span>碰撞</span></div>';
@@ -2571,6 +3532,16 @@ function drawAlgoLayers(ctx, view){
     ctx.fillStyle = c.replan;
     for (const cell of vis.replanCells.values()) cellRect(cell, ctx, view);
   }
+  if (vis.backClosed.size){
+    ctx.fillStyle = c.backClosed; ctx.globalAlpha = 0.5;
+    for (const cell of vis.backClosed.values()) cellRect(cell, ctx, view);
+    ctx.globalAlpha = 1;
+  }
+  if (vis.backOpen.size){
+    ctx.fillStyle = c.backOpen; ctx.globalAlpha = 0.55;
+    for (const cell of vis.backOpen.values()) cellRect(cell, ctx, view);
+    ctx.globalAlpha = 1;
+  }
   if (vis.closedCells.size){
     ctx.fillStyle = c.closed; ctx.globalAlpha = 0.5;
     for (const cell of vis.closedCells.values()) cellRect(cell, ctx, view);
@@ -2592,7 +3563,7 @@ function drawAlgoLayers(ctx, view){
     ctx.stroke(); ctx.globalAlpha = 1;
   }
   // PRM / 可见性图 边
-  if (algo && (algo.id === 'prm' || algo.id === 'vgraph') && algo.edges && algo.samples && algo.edges.length){
+  if (algo && SAMPLE_GRAPH_IDS.has(algo.id) && algo.edges && algo.samples && algo.edges.length){
     ctx.strokeStyle = '#aab2bd'; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
     ctx.beginPath();
     for (const ed of algo.edges){
@@ -2604,7 +3575,7 @@ function drawAlgoLayers(ctx, view){
     ctx.stroke(); ctx.globalAlpha = 1;
   }
   // RRT 树
-  if (algo && (algo.id === 'rrt' || algo.id === 'rrtstar') && algo.nodes && algo.edges){
+  if (algo && RRT_TREE_IDS.has(algo.id) && algo.nodes && algo.edges){
     ctx.lineWidth = 1.2;
     for (const ed of algo.edges){
       const na = algo.nodes[ed.a], nb = algo.nodes[ed.b];
@@ -3107,6 +4078,8 @@ if (IS_WORKER){
       world.obstacles = msg.obstacles;
       goal.x = msg.goal.x; goal.y = msg.goal.y;
       start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
+      car.x = start.x; car.y = start.y; car.theta = start.theta || 0;
+      if (msg.apfSpeed !== undefined) APF_SPEED = msg.apfSpeed;
       grid.buildFromWorld(); /* 吸附与算法 init 都依赖网格 */
       dynamicStart = msg.dynamicStart || null;
       if (dynamicStart){
