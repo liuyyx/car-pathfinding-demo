@@ -3872,15 +3872,16 @@ function drawPath2D(ctx, P){
       const end = at(shown - 0.5), st = at(sCar + 0.5);
       const grad = ctx.createLinearGradient(st.x, st.y, end.x, end.y);
       /* 三层嵌套带宽,叠出柔边(无硬轮廓) */
+      /* 色谱取自真实 FSD 截图采样:核心 #0076F4 饱和蓝,外缘羽化 */
       const bands = [
-        { hw: 17*zk, a: 0.10, c1:'88,168,244', c2:'88,168,244' },
-        { hw: 11*zk, a: 0.20, c1:'96,176,246', c2:'96,176,246' },
-        { hw: 5.5*zk, a: 0.42, c1:'170,216,252', c2:'150,200,248' }
+        { hw: 19*zk, a: 0.13, c1:'0,118,244', c2:'0,118,244' },
+        { hw: 12*zk, a: 0.32, c1:'0,118,244', c2:'0,118,244' },
+        { hw: 5*zk,  a: 0.95, c1:'12,126,247', c2:'0,112,238' }
       ];
       for (const B of bands){
         grad.addColorStop(0,   'rgba(' + B.c1 + ',' + B.a.toFixed(3) + ')');
-        grad.addColorStop(0.22,'rgba(' + B.c1 + ',' + (B.a*0.82).toFixed(3) + ')');
-        grad.addColorStop(0.6, 'rgba(' + B.c2 + ',' + (B.a*0.34).toFixed(3) + ')');
+        grad.addColorStop(0.45,'rgba(' + B.c1 + ',' + (B.a*0.95).toFixed(3) + ')');
+        grad.addColorStop(0.80,'rgba(' + B.c2 + ',' + (B.a*0.34).toFixed(3) + ')');
         grad.addColorStop(1,   'rgba(' + B.c2 + ',0)');
         ctx.fillStyle = grad;
         ctx.beginPath();
