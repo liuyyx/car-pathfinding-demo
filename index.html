@@ -289,6 +289,7 @@ const REVERSE_SPEED = 0.6; /* 倒车速度相对前进的倍率(真车倒车更�
 const MAX_STEER = 35*Math.PI/180;
 const TURN_SPEED = 0.5;    /* 掉头/倒车时的车速倍率:低速才转得动,也给防撞探针留反应距离 */
 const LOOK_T = 0.35;       /* 防撞探针的预演时长(秒) */
+const GEAR_HOLD = 250;     /* 前进/倒车换挡后的保持时长(ms):防止在边界上逐帧来回横跳 */
 const RRT_STEP = 48, GOAL_R = 40, REWIRE_R = 120;
 const PRM_N = 2000, PRM_K = 8; /* 地图扩大后采样点按面积比例增加 */
 const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
@@ -356,6 +357,7 @@ let algId = 'astar', pathMode = 'line', pathStyle = 'line', manualSteer = false,
 let failMsg = '', flashStart = 0, tracker = null;
 let carReverse = false; /* 倒车中(车尾朝目标倒退) */
 let carTurnPhase = false; /* 掉头阶段(路径目标在车后方):降速 + 最大转向角 */
+let gearLockT = 0;        /* 换挡保持到该时刻,防止前进/倒车高频互切 */
 let stallPos = null, stallT = 0, stallWarned = false; /* 卡死检测(前后均被堵) */
 let selectedObstacle = null;
 let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
@@ -513,7 +515,10 @@ function vehicleCollides(c,obs){
    否则一贴住就前进倒车都被拦死,车会永久卡在墙上。 */
 function pathClear(v, dtTotal){
   const nowHit = car.x < 0 || car.y < 0 || car.x > W || car.y > H || vehicleCollides(car, world.obstacles);
-  const steps = 6, dt = dtTotal/steps;
+  const dist = Math.abs(v)*dtTotal;
+  /* 步长 ≤10px:高速/高倍速下也采样得足够密,不会从障碍上跳过去 */
+  const steps = Math.max(4, Math.min(24, Math.ceil(dist/10)));
+  const dt = dtTotal/steps;
   const tanD = Math.tan(car.delta);
   let px = car.x, py = car.y, th = car.theta;
   for (let i=0;i<steps;i++){
@@ -3252,7 +3257,7 @@ function actionText(msg){ actionEl.textContent = msg; }
 function resetCarToStart(){
   car.x = start.x; car.y = start.y; car.theta = start.theta;
   car.v = 0; car.delta = 0; car.collided = false;
-  carReverse = false; carTurnPhase = false; stallPos = null; stallWarned = false;
+  carReverse = false; carTurnPhase = false; gearLockT = 0; stallPos = null; stallWarned = false;
 }
 function visPathFromAlgo(){
   vis.path.length = 0;
@@ -3592,30 +3597,50 @@ function handleCarCollision(){
   fail('小车碰撞到障碍物', true);
   return false;
 }
+/* 自动行驶一步:正常行驶与重规划巡航共用 —— 两条路径下都有同样的掉头降速与防撞。
+   纯追踪给转向 → 掉头阶段降速 → 按当前挡位做弧线预演,不安全就换挡;
+   换挡后锁定 GEAR_HOLD 毫秒,否则会在"前进会撞/倒车安全"的边界上逐帧互切,看着就是左右横跳。
+   返回 false 表示前后都堵死(调用方可据此触发重规划)。 */
+function driveStep(dt){
+  const dG = dist(car, goal);
+  let sp = +speedRange.value;
+  if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
+  const delta = trackerSteer();
+  const vFwd = carTurnPhase ? sp*TURN_SPEED : sp;
+  const vBack = -sp*TURN_SPEED*REVERSE_SPEED;
+  const now = performance.now();
+  const holding = now < gearLockT;
+  if (!holding) carReverse = false;
+  car.delta = carReverse ? -delta : delta;
+  let blocked = false;
+  if (pathClear(carReverse ? vBack : vFwd, LOOK_T)){
+    car.v = carReverse ? vBack : vFwd;
+  } else if (holding){
+    car.v = 0; gearLockT = 0; /* 保持期间变危险:停车解锁,下一帧重新决策 */
+  } else {
+    car.delta = carReverse ? delta : -delta;
+    if (pathClear(carReverse ? vFwd : vBack, LOOK_T)){
+      car.v = carReverse ? vFwd : vBack;
+      carReverse = !carReverse;
+      gearLockT = now + GEAR_HOLD;
+    } else {
+      car.v = 0; car.delta = 0; carReverse = false; blocked = true;
+    }
+  }
+  carStep(car, dt);
+  return !blocked;
+}
 function followStep(dt){
   const dt2 = dt*speedMult;
   if (manualSteer){
-    carReverse = false; carTurnPhase = false;
+    carReverse = false; carTurnPhase = false; gearLockT = 0;
     car.v = +speedRange.value;
     car.delta = +steerRange.value*Math.PI/180;
+    carStep(car, dt2);
   } else {
-    const dG = dist(car, goal);
-    let sp = +speedRange.value;
-    if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
-    const delta = trackerSteer();
-    /* 先按前进预演一段弧线:车头方向被堵(驶入死胡同/要掉头)就改倒车,
-       倒车方向盘反向,车尾划弧把车头掉向目标;两边都不安全才停住等重规划。
-       掉头与倒车都降速,低速才转得动,也给探针留出反应距离。 */
-    const vFwd = carTurnPhase ? sp*TURN_SPEED : sp;
-    car.delta = delta; car.v = vFwd; carReverse = false;
-    if (!pathClear(vFwd, LOOK_T)){
-      const vBack = -sp*TURN_SPEED*REVERSE_SPEED;
-      car.delta = -delta;
-      if (pathClear(vBack, LOOK_T)){ car.v = vBack; carReverse = true; }
-      else { car.v = 0; car.delta = 0; carReverse = false; lastReplanT = 0; tryReplan(true); }
-    }
+    /* 纯追踪 + 掉头降速 + 防撞决策都在 driveStep 里;被完全堵住就立刻请求重规划 */
+    if (!driveStep(dt2)){ lastReplanT = 0; tryReplan(true); }
   }
-  carStep(car, dt2);
   if (mode === 'following'){
     /* 前方路径被真实障碍挡住就重规划(与"启用移动"无关):
        感知模式下路径可能穿过尚未看到的区域,提前 600px 发现即绕开,车不硬闯。 */
@@ -4292,10 +4317,9 @@ function loop(t){
       if (algo.done){
         afterSearchDone();
       } else if (replanning && tracker && mode === 'searching'){
-        // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
-        car.v = +speedRange.value;
-        car.delta = trackerSteer();
-        carStep(car, dt*speedMult);
+        /* 重规划进行中:车沿旧轨迹继续行驶 —— 与正常行驶共用 driveStep(掉头降速 + 防撞预检)。
+           此前这里直接按滑杆全速推车、没有任何预检,重规划期间就成了闭眼冲。 */
+        driveStep(dt*speedMult);
         if (vehicleCollides(car, world.obstacles)){
           if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
           /* 撞移动 → 重规划已在搜索中,本帧不动 */
@@ -4314,10 +4338,8 @@ function loop(t){
       }
       if (algo.done) afterSearchDone();
       else if (replanning && tracker && mode === 'searching'){
-        // 重规划进行中:车沿旧轨迹持续巡航,保持设定速度
-        car.v = +speedRange.value;
-        car.delta = trackerSteer();
-        carStep(car, dt*speedMult);
+        // 重规划进行中:车沿旧轨迹继续行驶(与正常行驶共用 driveStep:掉头降速 + 防撞预检)
+        driveStep(dt*speedMult);
         if (vehicleCollides(car, world.obstacles)){
           if (!handleCarCollision()) return; /* 撞静态 → 已 fail */
           /* 撞移动 → 重规划已在搜索中,本帧不动 */
