@@ -284,6 +284,11 @@ const GOAL_CLEAR = CLEAR_TREE + 4; /* 终点必须距障碍的距离(保证终�
 const START_R = 90, GOAL_PROT_R = 70;
 const LOOKAHEAD = 60, ARRIVE_DIST = 30;
 const REVERSE_SPEED = 0.6; /* 倒车速度相对前进的倍率(真车倒车更慢) */
+/* 最大转向角:真实乘用车约 30~40°,对应最小转弯半径 36/tan35° ≈ 51px(约 0.9 车长)。
+   原来纯追踪在 |α|=90° 处会算出 50.2°(转弯半径 30px,比车还短),视觉上像原地打转。 */
+const MAX_STEER = 35*Math.PI/180;
+const TURN_SPEED = 0.5;    /* 掉头/倒车时的车速倍率:低速才转得动,也给防撞探针留反应距离 */
+const LOOK_T = 0.35;       /* 防撞探针的预演时长(秒) */
 const RRT_STEP = 48, GOAL_R = 40, REWIRE_R = 120;
 const PRM_N = 2000, PRM_K = 8; /* 地图扩大后采样点按面积比例增加 */
 const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
@@ -349,7 +354,8 @@ let mode = 'idle', algo = null, running = false, dliteDirty = false;
 let APF_SPEED = 120; /* 势场法推进速度:Worker 无 DOM,由主线程随 start 消息下发 */
 let algId = 'astar', pathMode = 'line', pathStyle = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
-let carReverse = false; /* 倒车中:路径目标落到车尾方向,前进纯追踪失效时切换 */
+let carReverse = false; /* 倒车中(车尾朝目标倒退) */
+let carTurnPhase = false; /* 掉头阶段(路径目标在车后方):降速 + 最大转向角 */
 let stallPos = null, stallT = 0, stallWarned = false; /* 卡死检测(前后均被堵) */
 let selectedObstacle = null;
 let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
@@ -475,11 +481,6 @@ function carStep(c,dt){
   c.y += c.v*Math.sin(c.theta)*dt;
   c.theta += (c.v/WHEELBASE)*Math.tan(c.delta)*dt;
 }
-/* 按当前 v/delta 试算一步后的位姿(不改 car):倒车前的安全预检用 */
-function carStepProbe(v, dt){
-  return { x:car.x + v*Math.cos(car.theta)*dt, y:car.y + v*Math.sin(car.theta)*dt,
-           theta:car.theta + (v/WHEELBASE)*Math.tan(car.delta)*dt };
-}
 function obbCorners(x,y,theta,l,w){
   const c=Math.cos(theta), s=Math.sin(theta), hx=l/2, hy=w/2;
   return [
@@ -507,12 +508,20 @@ function vehicleCollides(c,obs){
   for (const o of obs) if (obbRectHit(c.x,c.y,c.theta,o,HIT_L,HIT_W)) return true;
   return false;
 }
-/* 移动许可:只有"从安全踏入碰撞/越界"才拦。车体已经贴上障碍时允许继续移动,
-   否则一贴住就前进倒车都被拦,车会永久卡死。 */
-function moveBlocked(p){
+/* 按当前转向,沿速度 v 预演 dtTotal 秒的弧线,检查整条弧线是否安全。
+   只拦"从安全踏入碰撞或越界"——车体已经贴住障碍时允许继续移动,
+   否则一贴住就前进倒车都被拦死,车会永久卡在墙上。 */
+function pathClear(v, dtTotal){
   const nowHit = car.x < 0 || car.y < 0 || car.x > W || car.y > H || vehicleCollides(car, world.obstacles);
-  const nextHit = p.x < 0 || p.y < 0 || p.x > W || p.y > H || vehicleCollides(p, world.obstacles);
-  return nextHit && !nowHit;
+  const steps = 6, dt = dtTotal/steps;
+  const tanD = Math.tan(car.delta);
+  let px = car.x, py = car.y, th = car.theta;
+  for (let i=0;i<steps;i++){
+    px += v*Math.cos(th)*dt; py += v*Math.sin(th)*dt; th += (v/WHEELBASE)*tanD*dt;
+    if (px < 0 || py < 0 || px > W || py > H) { if (!nowHit) return false; }
+    else if (!nowHit && vehicleCollides({ x:px, y:py, theta:th }, world.obstacles)) return false;
+  }
+  return true;
 }
 /* 混合 A* 碰撞分桶:按障碍 12px 膨胀盒建空间桶,只测车体附近障碍(原全障碍 O(589) 扫描) */
 const BUCKET = 96, PROBE_PAD = 40; /* 桶 96px;车体半长 28 + 12 膨胀 */
@@ -583,19 +592,19 @@ function buildSpline(pts){
   return dense;
 }
 function trackerSteer(){
-  if (!tracker || tracker.pts.length < 2) return 0;
+  if (!tracker || tracker.pts.length < 2){ carTurnPhase = false; return 0; }
   const pts = tracker.pts;
   let target = pts[pts.length-1];
   for (let i=tracker.idx;i<pts.length;i++){
     if (Math.hypot(pts[i].x-car.x, pts[i].y-car.y) >= LOOKAHEAD){ target = pts[i]; tracker.idx = i; break; }
   }
   const alpha = normAngle(Math.atan2(target.y-car.y, target.x-car.x) - car.theta);
-  /* 目标落到车后方(|α|>90°)时 sin α 变小乃至归零,前进纯追踪退化成直行(顶住障碍不动)。
-     这一段改用"朝目标侧满舵"—— 与 α=90° 处的纯追踪转角连续,让车以最小转弯半径
-     划弧把车头掉向目标,α 回到前方后自动接回纯追踪。 */
-  const mag = Math.atan2(2*WHEELBASE, LOOKAHEAD); /* = α=90° 时的纯追踪转角(满舵) */
-  if (Math.abs(alpha) > Math.PI/2) return alpha > 0 ? mag : -mag;
-  return Math.atan2(2*WHEELBASE*Math.sin(alpha), LOOKAHEAD);
+  /* 目标落到车后方(|α|>90°)时 sin α 变小乃至归零,前进纯追踪会退化成直行(顶住障碍不动):
+     这一段按最大转向角朝目标侧转,把车头掉向目标,α 回到前方后自动接回纯追踪。 */
+  carTurnPhase = Math.abs(alpha) > Math.PI/2;
+  const d = carTurnPhase ? (alpha > 0 ? MAX_STEER : -MAX_STEER)
+                         : Math.atan2(2*WHEELBASE*Math.sin(alpha), LOOKAHEAD);
+  return clamp(d, -MAX_STEER, MAX_STEER); /* 统一限幅到真实车最大转向角 */
 }
 
 /* ============ 二叉堆 ============ */
@@ -3243,7 +3252,7 @@ function actionText(msg){ actionEl.textContent = msg; }
 function resetCarToStart(){
   car.x = start.x; car.y = start.y; car.theta = start.theta;
   car.v = 0; car.delta = 0; car.collided = false;
-  carReverse = false; stallPos = null; stallWarned = false;
+  carReverse = false; carTurnPhase = false; stallPos = null; stallWarned = false;
 }
 function visPathFromAlgo(){
   vis.path.length = 0;
@@ -3586,7 +3595,7 @@ function handleCarCollision(){
 function followStep(dt){
   const dt2 = dt*speedMult;
   if (manualSteer){
-    carReverse = false;
+    carReverse = false; carTurnPhase = false;
     car.v = +speedRange.value;
     car.delta = +steerRange.value*Math.PI/180;
   } else {
@@ -3594,16 +3603,16 @@ function followStep(dt){
     let sp = +speedRange.value;
     if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
     const delta = trackerSteer();
-    /* 先按前进试算一步:车头方向被堵(驶入死胡同/需掉头)时改倒车,
-       倒车方向盘反向,车尾划弧把车头掉向目标;两边都堵才停住等重规划。
-       倒车只在"下一小步会撞"时发生,车头一旦转回来立即恢复前进。 */
-    car.delta = delta; car.v = sp; carReverse = false;
-    if (moveBlocked(carStepProbe(sp, dt2))){
-      car.delta = -delta; car.v = -sp*REVERSE_SPEED; carReverse = true;
-      if (moveBlocked(carStepProbe(car.v, dt2))){
-        car.v = 0; car.delta = 0; carReverse = false;
-        lastReplanT = 0; tryReplan(true);
-      }
+    /* 先按前进预演一段弧线:车头方向被堵(驶入死胡同/要掉头)就改倒车,
+       倒车方向盘反向,车尾划弧把车头掉向目标;两边都不安全才停住等重规划。
+       掉头与倒车都降速,低速才转得动,也给探针留出反应距离。 */
+    const vFwd = carTurnPhase ? sp*TURN_SPEED : sp;
+    car.delta = delta; car.v = vFwd; carReverse = false;
+    if (!pathClear(vFwd, LOOK_T)){
+      const vBack = -sp*TURN_SPEED*REVERSE_SPEED;
+      car.delta = -delta;
+      if (pathClear(vBack, LOOK_T)){ car.v = vBack; carReverse = true; }
+      else { car.v = 0; car.delta = 0; carReverse = false; lastReplanT = 0; tryReplan(true); }
     }
   }
   carStep(car, dt2);
