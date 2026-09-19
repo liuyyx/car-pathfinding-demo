@@ -4063,14 +4063,16 @@ function render(){
 let pbState = '';
 /* 空闲时禁用 播放/暂停/单步,运行中高亮"暂停",消除"点了没反应" */
 function syncPlaybackUI(){
-  const active = (mode === 'searching' || mode === 'following');
+  /* 已到达终点且有路径时可重播,故同样视为可控制 */
+  const hasTrack = !!(tracker && tracker.pts && tracker.pts.length >= 2);
+  const active = (mode === 'searching' || mode === 'following' || (mode === 'arrived' && hasTrack));
   const key = active + ':' + running + ':' + mode;
   if (key === pbState) return;
   pbState = key;
   btnPlay.disabled = !active || running;
   btnPause.disabled = !active || !running;
   btnStep.disabled = !active || (running && mode === 'searching');
-  btnPause.classList.toggle('ctl-on', active && running);
+  btnPause.classList.toggle('ctl-on', active && running && mode !== 'arrived');
 }
 /* 移动障碍门控:未启用移动时,持续寻路/随机移动不可用 */
 function syncMoveGate(){
@@ -4163,6 +4165,7 @@ canvas.addEventListener('mousedown', e => {
   const t = document.querySelector('input[name=tool]:checked').value;
   if (e.button === 0){
     if (t === 'patrol'){
+      if (!moveChk.checked){ actionText('请先勾选"启用移动",再编辑障碍移动路径'); return; }
       const w = s2w(sx,sy);
       let hit = null;
       for (let i=0;i<world.obstacles.length;i++){
@@ -4246,8 +4249,18 @@ btnRegen.addEventListener('click', () => {
   actionText('已重新生成障碍物');
 });
 btnStart.addEventListener('click', startSearch);
+function replayPath(){ /* 到达终点后重播:车回起点,沿原路径再走一遍 */
+  if (!(tracker && tracker.pts && tracker.pts.length >= 2)) return false;
+  tracker.idx = 0;
+  resetCarToStart();
+  vis.pathT0 = performance.now(); /* 重播时再放一次揭示动画 */
+  mode = 'following';
+  return true;
+}
 btnPlay.addEventListener('click', () => {
+  if (mode === 'arrived' && replayPath()){ running = true; actionText('重播路径…'); syncPlaybackUI(); return; }
   if (mode === 'searching' || mode === 'following'){ running = true; }
+  syncPlaybackUI();
 });
 btnPause.addEventListener('click', () => { running = false; syncPlaybackUI(); });
 moveChk.addEventListener('change', syncMoveGate);
@@ -4259,7 +4272,12 @@ btnStep.addEventListener('click', () => {
   } else if (mode === 'following'){
     running = false;
     followStep(1/60);
+  } else if (mode === 'arrived' && replayPath()){
+    running = false;
+    followStep(1/60); /* 重播并只走一步(便于逐帧观察) */
+    actionText('重播:单步');
   }
+  syncPlaybackUI();
 });
 speedSel.addEventListener('change', () => { speedMult = +speedSel.value; });
 /* 滑条填充进度(自定义轨道渐变) */
@@ -4275,6 +4293,7 @@ manualChk.addEventListener('change', () => {
 });
 moveSpeedRange.addEventListener('input', () => { moveSpeedVal.textContent = moveSpeedRange.value; });
 btnRandomMove.addEventListener('click', () => {
+  if (!moveChk.checked){ actionText('请先勾选"启用移动"'); return; }
   if (selectedObstacle){
     const o = selectedObstacle;
     o.patrol = null; o.patrolIdx = 0;
