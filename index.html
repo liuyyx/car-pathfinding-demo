@@ -283,6 +283,7 @@ const CLEAR_TREE = 34; /* RRT/PRM 树边线段外扩:额外补偿纯追踪在折
 const GOAL_CLEAR = CLEAR_TREE + 4; /* 终点必须距障碍的距离(保证终点格自由且 RRT/PRM 可连接) */
 const START_R = 90, GOAL_PROT_R = 70;
 const LOOKAHEAD = 60, ARRIVE_DIST = 30;
+const REVERSE_SPEED = 0.6; /* 倒车速度相对前进的倍率(真车倒车更慢) */
 const RRT_STEP = 48, GOAL_R = 40, REWIRE_R = 120;
 const PRM_N = 2000, PRM_K = 8; /* 地图扩大后采样点按面积比例增加 */
 const K_ATT = 0.15, K_REP = 4000, D0 = 140, STALL_N = 60;
@@ -348,6 +349,8 @@ let mode = 'idle', algo = null, running = false, dliteDirty = false;
 let APF_SPEED = 120; /* 势场法推进速度:Worker 无 DOM,由主线程随 start 消息下发 */
 let algId = 'astar', pathMode = 'line', pathStyle = 'line', manualSteer = false, speedMult = 1;
 let failMsg = '', flashStart = 0, tracker = null;
+let carReverse = false; /* 倒车中:路径目标落到车尾方向,前进纯追踪失效时切换 */
+let stallPos = null, stallT = 0, stallWarned = false; /* 卡死检测(前后均被堵) */
 let selectedObstacle = null;
 let dynamicStart = null; /* 非空时算法以它为起点(移动障碍触发重新规划) */
 let replanning = false; /* 重规划进行中:车沿旧轨迹巡航不停车 */
@@ -472,6 +475,11 @@ function carStep(c,dt){
   c.y += c.v*Math.sin(c.theta)*dt;
   c.theta += (c.v/WHEELBASE)*Math.tan(c.delta)*dt;
 }
+/* 按当前 v/delta 试算一步后的位姿(不改 car):倒车前的安全预检用 */
+function carStepProbe(v, dt){
+  return { x:car.x + v*Math.cos(car.theta)*dt, y:car.y + v*Math.sin(car.theta)*dt,
+           theta:car.theta + (v/WHEELBASE)*Math.tan(car.delta)*dt };
+}
 function obbCorners(x,y,theta,l,w){
   const c=Math.cos(theta), s=Math.sin(theta), hx=l/2, hy=w/2;
   return [
@@ -498,6 +506,13 @@ const HIT_L = CAR_L - 8, HIT_W = CAR_W - 8;
 function vehicleCollides(c,obs){
   for (const o of obs) if (obbRectHit(c.x,c.y,c.theta,o,HIT_L,HIT_W)) return true;
   return false;
+}
+/* 移动许可:只有"从安全踏入碰撞/越界"才拦。车体已经贴上障碍时允许继续移动,
+   否则一贴住就前进倒车都被拦,车会永久卡死。 */
+function moveBlocked(p){
+  const nowHit = car.x < 0 || car.y < 0 || car.x > W || car.y > H || vehicleCollides(car, world.obstacles);
+  const nextHit = p.x < 0 || p.y < 0 || p.x > W || p.y > H || vehicleCollides(p, world.obstacles);
+  return nextHit && !nowHit;
 }
 /* 混合 A* 碰撞分桶:按障碍 12px 膨胀盒建空间桶,只测车体附近障碍(原全障碍 O(589) 扫描) */
 const BUCKET = 96, PROBE_PAD = 40; /* 桶 96px;车体半长 28 + 12 膨胀 */
@@ -575,6 +590,11 @@ function trackerSteer(){
     if (Math.hypot(pts[i].x-car.x, pts[i].y-car.y) >= LOOKAHEAD){ target = pts[i]; tracker.idx = i; break; }
   }
   const alpha = normAngle(Math.atan2(target.y-car.y, target.x-car.x) - car.theta);
+  /* 目标落到车后方(|α|>90°)时 sin α 变小乃至归零,前进纯追踪退化成直行(顶住障碍不动)。
+     这一段改用"朝目标侧满舵"—— 与 α=90° 处的纯追踪转角连续,让车以最小转弯半径
+     划弧把车头掉向目标,α 回到前方后自动接回纯追踪。 */
+  const mag = Math.atan2(2*WHEELBASE, LOOKAHEAD); /* = α=90° 时的纯追踪转角(满舵) */
+  if (Math.abs(alpha) > Math.PI/2) return alpha > 0 ? mag : -mag;
   return Math.atan2(2*WHEELBASE*Math.sin(alpha), LOOKAHEAD);
 }
 
@@ -3223,6 +3243,7 @@ function actionText(msg){ actionEl.textContent = msg; }
 function resetCarToStart(){
   car.x = start.x; car.y = start.y; car.theta = start.theta;
   car.v = 0; car.delta = 0; car.collided = false;
+  carReverse = false; stallPos = null; stallWarned = false;
 }
 function visPathFromAlgo(){
   vis.path.length = 0;
@@ -3565,26 +3586,39 @@ function handleCarCollision(){
 function followStep(dt){
   const dt2 = dt*speedMult;
   if (manualSteer){
+    carReverse = false;
     car.v = +speedRange.value;
     car.delta = +steerRange.value*Math.PI/180;
   } else {
     const dG = dist(car, goal);
     let sp = +speedRange.value;
     if (dG < 60) sp = Math.max(sp*0.25, sp*dG/60);
-    car.v = sp;
-    car.delta = trackerSteer();
+    const delta = trackerSteer();
+    /* 先按前进试算一步:车头方向被堵(驶入死胡同/需掉头)时改倒车,
+       倒车方向盘反向,车尾划弧把车头掉向目标;两边都堵才停住等重规划。
+       倒车只在"下一小步会撞"时发生,车头一旦转回来立即恢复前进。 */
+    car.delta = delta; car.v = sp; carReverse = false;
+    if (moveBlocked(carStepProbe(sp, dt2))){
+      car.delta = -delta; car.v = -sp*REVERSE_SPEED; carReverse = true;
+      if (moveBlocked(carStepProbe(car.v, dt2))){
+        car.v = 0; car.delta = 0; carReverse = false;
+        lastReplanT = 0; tryReplan(true);
+      }
+    }
   }
   carStep(car, dt2);
-  if (mode === 'following' && moveChk.checked){
-    if (persistChk.checked){
-      // 持续寻路:每 0.2s 强制重规划,车始终沿最新路径
-      if (performance.now() - lastPersistT > 200){
-        lastPersistT = performance.now();
-        tryReplan(true);
-      }
-    } else {
-      tryReplan(false);
-      if (gridChangedByMoving()) tryReplan(true);
+  if (mode === 'following'){
+    /* 前方路径被真实障碍挡住就重规划(与"启用移动"无关):
+       感知模式下路径可能穿过尚未看到的区域,提前 600px 发现即绕开,车不硬闯。 */
+    tryReplan(false);
+    if (moveChk.checked){
+      if (persistChk.checked){
+        // 持续寻路:每 0.2s 强制重规划,车始终沿最新路径
+        if (performance.now() - lastPersistT > 200){
+          lastPersistT = performance.now();
+          tryReplan(true);
+        }
+      } else if (gridChangedByMoving()) tryReplan(true);
     }
   }
   if (vehicleCollides(car, world.obstacles)){
@@ -3598,6 +3632,14 @@ function followStep(dt){
     failMsg = '';
     pushMetrics();
     actionText('已到达终点');
+    return;
+  }
+  /* 卡死检测:连续 5s 位移极小(前进/倒车都被堵) → 明确提示,避免"车不动也说不清"的哑状态 */
+  if (!stallPos || Math.hypot(car.x-stallPos.x, car.y-stallPos.y) > 14){
+    stallPos = { x:car.x, y:car.y }; stallT = performance.now(); stallWarned = false;
+  } else if (!stallWarned && performance.now() - stallT > 5000){
+    stallWarned = true;
+    actionText('小车被困:前后都被堵住,可移动障碍物或点"重置"');
   }
 }
 function fail(msg, fromFollowing){
@@ -4114,6 +4156,12 @@ function drawCar(ctx){
   ctx.shadowColor = 'rgba(255,80,110,.85)'; ctx.fillStyle = '#ff5a72';
   ctx.beginPath(); ctx.roundRect(-L/2+4, -HW+3.5, 4, 5.5, 2); ctx.fill();
   ctx.beginPath(); ctx.roundRect(-L/2+4, HW-9, 4, 5.5, 2); ctx.fill();
+  /* 倒车灯(车尾白色):倒车时点亮,和真车一致 */
+  if (carReverse){
+    ctx.shadowColor = 'rgba(225,245,255,.95)'; ctx.fillStyle = '#f4fbff';
+    ctx.beginPath(); ctx.roundRect(-L/2+4, -HW+10.5, 4, 5.5, 2); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(-L/2+4, HW-16, 4, 5.5, 2); ctx.fill();
+  }
   ctx.restore();
 }
 function render(){
