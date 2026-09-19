@@ -3175,7 +3175,11 @@ function resetCarToStart(){
 function visPathFromAlgo(){
   vis.path.length = 0;
   if (algo && algo.path) for (const p of algo.path) vis.path.push(p);
-  if (!IS_WORKER && vis.path.length >= 2) vis.pathT0 = performance.now(); /* 触发揭示动画 */
+  if (IS_WORKER) return;
+  /* 仅用户发起的搜索播放一次揭示动画;重规划(持续寻路每 200ms 一次)不重放,
+     否则动画永远停在"点亮一半"被重置,视觉上线会持续闪烁 */
+  const isReplan = replanning || !!dynamicStart || !!(algo && algo.replanRun);
+  vis.pathT0 = (!isReplan && vis.path.length >= 2) ? performance.now() : 0;
 }
 function startSearch(){
   if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
