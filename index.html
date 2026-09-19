@@ -69,6 +69,7 @@
   .p-field-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; font-size:12px; color:var(--text-2); }
   .p-field input[type=range] { width:100%; }
   .p-check { display:inline-flex; align-items:center; gap:6px; color:var(--text-2); font-size:12.5px; flex:1; }
+  .m-note { color:var(--text-3); font-size:11px; line-height:1.45; }
   /* 分段选择器(radio 胶囊) */
   .p-seg { display:grid; grid-auto-flow:column; grid-auto-columns:1fr; gap:4px;
     background:rgba(0,0,0,.22); border:1px solid var(--border-soft); border-radius:9px; padding:3px; }
@@ -197,6 +198,23 @@
   </section>
 
   <section class="p-sec">
+    <div class="p-sec-label">感知<span class="p-count" id="exploreVal">0%</span></div>
+    <div class="p-seg">
+      <label><input type="radio" name="perception" value="off" checked><span>上帝视角</span></label>
+      <label><input type="radio" name="perception" value="on"><span>仅小车视角</span></label>
+    </div>
+    <div class="p-field">
+      <div class="p-field-head"><span>视野半径</span><span class="val" id="visRVal">900</span></div>
+      <input type="range" id="visRRange" min="300" max="1800" step="50" value="900">
+    </div>
+    <div class="p-field">
+      <div class="p-field-head"><span>未知区代价</span><span class="val" id="unknownCostVal">4×</span></div>
+      <input type="range" id="unknownCostRange" min="1" max="10" step="1" value="4">
+    </div>
+    <div class="m-note">未知区代价作用于代价最优类:astar / dijkstra / dlite / theta / bidir / ara;其余算法把未知区视为普通可通行区</div>
+  </section>
+
+  <section class="p-sec">
     <div class="p-sec-label">环境</div>
     <div class="p-field">
       <div class="p-field-head"><span>障碍覆盖率</span><span class="val" id="coverVal">12%</span></div>
@@ -316,6 +334,9 @@ const steerRange = IS_WORKER ? null : $('steerRange'), steerVal = IS_WORKER ? nu
 const btnReplan = IS_WORKER ? null : $('btnReplan'), btnReset = IS_WORKER ? null : $('btnReset'), btnResetStart = IS_WORKER ? null : $('btnResetStart');
 const panelToggle = IS_WORKER ? null : $('panelToggle'), btnCollapse = IS_WORKER ? null : $('btnCollapse'), algCount = IS_WORKER ? null : $('algCount');
 const moveChk = IS_WORKER ? null : $('moveChk'), persistChk = IS_WORKER ? null : $('persistChk'), moveSpeedRange = IS_WORKER ? null : $('moveSpeedRange'), moveSpeedVal = IS_WORKER ? null : $('moveSpeedVal'), btnRandomMove = IS_WORKER ? null : $('btnRandomMove'), btnClearPatrol = IS_WORKER ? null : $('btnClearPatrol');
+const visRRange = IS_WORKER ? null : $('visRRange'), visRVal = IS_WORKER ? null : $('visRVal');
+const unknownCostRange = IS_WORKER ? null : $('unknownCostRange'), unknownCostVal = IS_WORKER ? null : $('unknownCostVal');
+const exploreVal = IS_WORKER ? null : $('exploreVal');
 if (!IS_WORKER) ALGORITHMS.forEach(a => { const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; algSel.appendChild(o); });
 
 /* ============ 状态 ============ */
@@ -352,7 +373,7 @@ function aabbHit(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h &&
 function aabbMargin(a,b,m){ return a.x < b.x+b.w+m && a.x+a.w > b.x-m && a.y < b.y+b.h+m && a.y+a.h > b.y-m; }
 function circleRectHit(cx,cy,r,rc){ const px=clamp(cx,rc.x,rc.x+rc.w), py=clamp(cy,rc.y,rc.y+rc.h); const dx=cx-px, dy=cy-py; return dx*dx+dy*dy < r*r; }
 function inflated(r, cl){ cl = cl || CLEAR; return { x:r.x-cl, y:r.y-cl, w:r.w+2*cl, h:r.h+2*cl }; }
-function pointInInflated(px,py,cl){ for (const o of world.obstacles){ const i = inflated(o,cl); if (px>=i.x && px<=i.x+i.w && py>=i.y && py<=i.y+i.h) return true; } return false; }
+function pointInInflated(px,py,cl){ for (const o of visionObstacles()){ const i = inflated(o,cl); if (px>=i.x && px<=i.x+i.w && py>=i.y && py<=i.y+i.h) return true; } return false; }
 function pointFree(px,py){ return !pointInInflated(px,py,CLEAR_TREE) && px>=0 && py>=0 && px<=W && py<=H; }
 function rectClear(r){
   for (const o of world.obstacles) if (aabbMargin(r,o,8)) return false;
@@ -362,15 +383,25 @@ function rectClear(r){
 }
 const ck = c => c.x + ',' + c.y;
 
+/* ============ 感知(视线限制) ============
+   小车视角下算法只能看到"已见过的障碍";未知区可通行但代价高。
+   物理碰撞、编辑、世界渲染仍用真实 world.obstacles。 */
+let perceptionOn = false;      // 视线限制模式开关
+let knownObstacles = [];       // 已见过的障碍(按对象引用去重)
+let UNKNOWN_COST = 4;          // 未知格代价倍率(1=不计价)
+let visR = 900;                // 视野半径(世界像素)
+function visionObstacles(){ return perceptionOn ? knownObstacles : world.obstacles; }
+
 /* ============ 网格 ============ */
 const grid = {
   cols:0, rows:0, free:null,
+  visited:null,            // Uint8Array(cols*rows):1 = 曾看到过(仅感知模式维护)
   buildFromWorld(){
     this.cols = Math.ceil(W/GRID); this.rows = Math.ceil(H/GRID);
     this.free = new Uint8Array(this.cols*this.rows);
     for (let i=0;i<this.free.length;i++) this.free[i] = 1;
     // 每个障碍只标记其膨胀后覆盖的 cell 范围(O(障碍×覆盖格),替代逐格×障碍全对检查)
-    for (const o of world.obstacles){
+    for (const o of visionObstacles()){
       const ii = inflated(o);
       const x0 = Math.max(0, Math.floor(ii.x/GRID)), x1 = Math.min(this.cols-1, Math.floor((ii.x+ii.w)/GRID));
       const y0 = Math.max(0, Math.floor(ii.y/GRID)), y1 = Math.min(this.rows-1, Math.floor((ii.y+ii.h)/GRID));
@@ -384,6 +415,9 @@ const grid = {
   cellCenter(c){ return { x:(c.x+0.5)*GRID, y:(c.y+0.5)*GRID }; },
   inBounds(c){ return c.x>=0 && c.x<this.cols && c.y>=0 && c.y<this.rows; },
   isFree(c){ return this.inBounds(c) && this.free[c.y*this.cols+c.x] === 1; },
+  isVisited(c){ return !!this.visited && this.inBounds(c) && this.visited[c.y*this.cols+c.x] === 1; },
+  /* 未知区代价:感知模式下从未被看到的格子按倍率加价(未知≠不可通行) */
+  penalty(c){ return (perceptionOn && !this.isVisited(c)) ? UNKNOWN_COST : 1; },
   neighbors8(c){
     const out = [];
     for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
@@ -393,7 +427,7 @@ const grid = {
       if (dx && dy){
         if (!this.isFree({ x:c.x+dx, y:c.y }) || !this.isFree({ x:c.x, y:c.y+dy })) continue;
       }
-      out.push({ c:n, cost:(dx&&dy)?SQRT2:1 });
+      out.push({ c:n, cost:((dx&&dy)?SQRT2:1) * this.penalty(n) });
     }
     return out;
   }
@@ -471,8 +505,9 @@ let obsBuckets = null;
 function buildObstacleBuckets(){
   obsBuckets = new Map();
   const bw = Math.ceil(W/BUCKET), bh = Math.ceil(H/BUCKET);
-  for (let i=0;i<world.obstacles.length;i++){
-    const o = world.obstacles[i];
+  const src = visionObstacles();
+  for (let i=0;i<src.length;i++){
+    const o = src[i];
     const bx0 = Math.max(0, Math.floor((o.x-20)/BUCKET)), bx1 = Math.min(bw-1, Math.floor((o.x+o.w+20)/BUCKET));
     const by0 = Math.max(0, Math.floor((o.y-20)/BUCKET)), by1 = Math.min(bh-1, Math.floor((o.y+o.h+20)/BUCKET));
     for (let by=by0;by<=by1;by++) for (let bx=bx0;bx<=bx1;bx++){
@@ -484,8 +519,9 @@ function buildObstacleBuckets(){
   }
 }
 function probeCollides(x,y,theta){
+  const src = visionObstacles();
   if (!obsBuckets){
-    for (const o of world.obstacles){
+    for (const o of src){
       // 混合 A* 轨迹为弧线段,折角处跟随会切角;碰撞检查加 12px 膨胀补偿
       if (obbRectHit(x,y,theta,{ x:o.x-18, y:o.y-18, w:o.w+36, h:o.h+36 },HIT_L,HIT_W)) return true;
     }
@@ -502,7 +538,7 @@ function probeCollides(x,y,theta){
       const oi = arr[ai];
       if (seen.indexOf(oi) >= 0) continue;
       seen.push(oi);
-      const o = world.obstacles[oi];
+      const o = src[oi];
       if (obbRectHit(x,y,theta,{ x:o.x-18, y:o.y-18, w:o.w+36, h:o.h+36 },HIT_L,HIT_W)) return true;
     }
   }
@@ -741,7 +777,7 @@ function createDlite(){
     h(c){ return Math.hypot(c.x-this.startC.x, c.y-this.startC.y); },
     cost(u,v){
       if (!grid.isFree(u) || !grid.isFree(v)) return Infinity;
-      return (u.x!==v.x && u.y!==v.y) ? SQRT2 : 1;
+      return ((u.x!==v.x && u.y!==v.y) ? SQRT2 : 1) * grid.penalty(v);
     },
     calcKey(c){
       const k = ck(c);
@@ -846,7 +882,8 @@ function createDlite(){
           const nbc = nb.c;
           const gv = this.g.get(ck(nbc));
           if (gv === undefined) continue;
-          const v = gv + this.cost(c, nbc);
+          /* 与 updateVertex 的 cost(nb,u) 同向:代价含"进入目标格"的附加项,方向不一致会来回震荡 */
+          const v = gv + this.cost(nbc, c);
           if (v < bc){ bc = v; best = nbc; }
         }
         if (!best){ this.failReason='无可行路径(路径不连通)'; this.path=[]; return; }
@@ -884,7 +921,8 @@ function segmentFree(a,b){
   const minx = Math.min(a.x,b.x), maxx = Math.max(a.x,b.x);
   const miny = Math.min(a.y,b.y), maxy = Math.max(a.y,b.y);
   const nearby = [];
-  for (const o of world.obstacles){
+  const src = visionObstacles();
+  for (const o of src){
     if (o.x+o.w < minx-CLEAR_TREE || o.x > maxx+CLEAR_TREE || o.y+o.h < miny-CLEAR_TREE || o.y > maxy+CLEAR_TREE) continue;
     nearby.push(inflated(o, CLEAR_TREE));
   }
@@ -1166,7 +1204,8 @@ function createAPF(){
       let fx = 0, fy = 0;
       fx += K_ATT*(goal.x-p.x)/Math.max(dG,1e-6);
       fy += K_ATT*(goal.y-p.y)/Math.max(dG,1e-6);
-      for (const o of world.obstacles){
+      const src = visionObstacles();
+      for (const o of src){
         const qx = clamp(p.x, o.x, o.x+o.w), qy = clamp(p.y, o.y, o.y+o.h);
         const dx = p.x-qx, dy = p.y-qy;
         const d = Math.hypot(dx,dy);
@@ -1677,6 +1716,7 @@ function createRRTConnect(){
 
 /* ============ 可见性图 ============ */
 function segmentFreeInfl(a,b,obsBuckets){
+  const src = visionObstacles();
   const minx = Math.min(a.x,b.x), maxx = Math.max(a.x,b.x);
   const miny = Math.min(a.y,b.y), maxy = Math.max(a.y,b.y);
   const nearby = [];
@@ -1689,13 +1729,13 @@ function segmentFreeInfl(a,b,obsBuckets){
       const arr = obsBuckets.get(by*bw+bx);
       if (!arr) continue;
       for (const oi of arr){
-        const o = world.obstacles[oi];
+        const o = src[oi];
         if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
         nearby.push(inflated(o, CLEAR));
       }
     }
   } else {
-    for (const o of world.obstacles){
+    for (const o of src){
       if (o.x+o.w < minx-CLEAR || o.x > maxx+CLEAR || o.y+o.h < miny-CLEAR || o.y > maxy+CLEAR) continue;
       nearby.push(inflated(o, CLEAR));
     }
@@ -1719,7 +1759,8 @@ function createVGraph(){
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     init(){
       this.nodes = [];
-      for (const o of world.obstacles){
+      const src = visionObstacles();
+      for (const o of src){
         const i = inflated(o);
         const cand = [
           {x:i.x-2, y:i.y-2}, {x:i.x+i.w+2, y:i.y-2},
@@ -1774,6 +1815,14 @@ function createVGraph(){
             }
           }
           if (order.length >= 60) break;
+        }
+        /* 感知模式下已知障碍少、节点可能相距数千像素,桶搜索半径覆盖不到 → 退化为全节点扫描 */
+        if (order.length < 4){
+          for (let j=0;j<this.nodes.length;j++){
+            if (j === si) continue;
+            const dx = p.x-this.nodes[j].x, dy = p.y-this.nodes[j].y;
+            order.push([j, dx*dx+dy*dy]);
+          }
         }
         order.sort((a,b)=>a[1]-b[1]);
         const kLimit = (si === this.startIdx || si === this.goalIdx) ? 40 : 20;
@@ -2151,7 +2200,7 @@ function createThetaStar(){
     id:'theta', name:'Theta* 任意角', done:false, path:[], replanRun:false, failReason:'',
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y)*GRID; },
-    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID * grid.penalty(v); },
     init(){
       grid.buildFromWorld();
       this.startC = grid.cellAt(algoStart().x, algoStart().y);
@@ -2241,7 +2290,7 @@ function createBidirectionalAstar(){
     id:'bidir', name:'双向 A*', done:false, path:[], replanRun:false, failReason:'',
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     h(c, t){ return Math.hypot(c.x-t.x, c.y-t.y)*GRID; },
-    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID * grid.penalty(v); },
     init(){
       grid.buildFromWorld();
       this.startC = grid.cellAt(algoStart().x, algoStart().y);
@@ -2349,7 +2398,7 @@ function createARA(){
     id:'ara', name:'ARA* 随时修复', done:false, path:[], replanRun:false, failReason:'',
     metrics:{ pathLen:0, expanded:0, timeMs:0, collisions:0 },
     h(c){ return Math.hypot(c.x-this.goalC.x, c.y-this.goalC.y)*GRID; },
-    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID; },
+    d(u,v){ return Math.hypot(u.x-v.x, u.y-v.y)*GRID * grid.penalty(v); },
     init(){
       grid.buildFromWorld();
       this.startC = grid.cellAt(algoStart().x, algoStart().y);
@@ -3110,7 +3159,9 @@ function postWorkerStart(params){
   worker1.onmessage = (e) => handleWorkerMsg(0, e.data);
   const startMsg = (seed) => ({ cmd:'start', algoId: params.algoId, obstacles: params.obstacles,
     goal: params.goal, start: params.start, dynamicStart: params.dynamicStart || null, seed, speedMult: speedMult,
-    apfSpeed: +speedRange.value });
+    apfSpeed: +speedRange.value,
+    /* 感知模式:Worker 只能看到已知障碍,未知区按倍率加价 */
+    perception: perceptionOn, known: knownObstacles, visited: grid.visited, unknownCost: UNKNOWN_COST });
   worker1.postMessage(startMsg(1));
   if (COMPETE_IDS.has(params.algoId)){
     /* 4 worker 竞争(不同随机种子):多核并行,先完成者胜 */
@@ -3133,7 +3184,8 @@ function postWorkerReplanDlite(changed, blockedAfter){
   }
   pendingBatches.length = 0;
   algo.blockedBefore = blockedAfter;
-  worker1.postMessage({ cmd:'replanDlite', changed, blockedBefore: blockedAfter, obstacles: world.obstacles });
+  worker1.postMessage({ cmd:'replanDlite', changed, blockedBefore: blockedAfter, obstacles: world.obstacles,
+    perception: perceptionOn, known: knownObstacles, visited: grid.visited, unknownCost: UNKNOWN_COST });
   workerReplanPending = true;
 }
 
@@ -3185,6 +3237,8 @@ function startSearch(){
   if (mode === 'searching' || mode === 'following') abortRun('已重新开始');
   dynamicStart = null;
   resetCarToStart();
+  /* 感知模式:从起点重新开始一段旅程,记忆清零后立刻做一次以起点为中心的观测 */
+  if (perceptionOn){ resetPerception(); updatePerception(); }
   if (workerOk){
     postWorkerStart({ algoId: algId, obstacles: world.obstacles,
       goal: { x:goal.x, y:goal.y }, start: { x:start.x, y:start.y, theta: 0 }, dynamicStart: null });
@@ -3361,15 +3415,93 @@ function frontBlocked(dist){
   }
   return false;
 }
+/* ============ 感知(视线限制):射线阴影 + 记忆 ============ */
+let lastPerceptionCar = { x:-1e9, y:-1e9 };
+let perceptionDirty = false, fogDirty = true, exploredCells = 0;
+let percBlocked = null, percOwner = null;   /* 复用的障碍格缓冲(尺寸不变,免每轮分配) */
+let percVisNow = null;                      /* 本帧可见格(射线未被遮挡):驱动迷雾透明区 */
+function updatePerception(){
+  if (!perceptionOn || IS_WORKER) return;
+  if (Math.hypot(car.x-lastPerceptionCar.x, car.y-lastPerceptionCar.y) < 5) return;
+  lastPerceptionCar = { x:car.x, y:car.y };
+  const cols = grid.cols, rows = grid.rows;
+  if (!grid.visited || grid.visited.length !== cols*rows) grid.visited = new Uint8Array(cols*rows);
+  if (!percBlocked || percBlocked.length !== cols*rows){
+    percBlocked = new Uint8Array(cols*rows); percOwner = new Int32Array(cols*rows);
+  }
+  if (!percVisNow || percVisNow.length !== cols*rows) percVisNow = new Uint8Array(cols*rows);
+  const blocked = percBlocked, owner = percOwner, visNow = percVisNow;
+  blocked.fill(0); visNow.fill(0);
+  /* 遮挡用真实矩形(不加 CLEAR 膨胀):车贴障碍时视野不会塌缩,阴影边界贴合可见轮廓 */
+  for (let i=0;i<world.obstacles.length;i++){
+    const o = world.obstacles[i];
+    const x0 = Math.max(0, Math.floor(o.x/GRID)), x1 = Math.min(cols-1, Math.floor((o.x+o.w)/GRID));
+    const y0 = Math.max(0, Math.floor(o.y/GRID)), y1 = Math.min(rows-1, Math.floor((o.y+o.h)/GRID));
+    for (let y=y0;y<=y1;y++){
+      const row = y*cols;
+      for (let x=x0;x<=x1;x++){ blocked[row+x] = 1; owner[row+x] = i+1; }
+    }
+  }
+  const startK = Math.floor(car.y/GRID)*cols + Math.floor(car.x/GRID);
+  /* 480 条(0.75°):末端相邻射线间距 ≈ 步长,可见掩码无缝;射线未遮挡的格同时驱动迷雾透明区 */
+  const RAYS = 480, stepW = GRID*0.5, maxSteps = Math.ceil(visR/stepW);
+  const found = new Set();
+  for (let r=0;r<RAYS;r++){
+    const a = r*2*Math.PI/RAYS, dx = Math.cos(a)*stepW, dy = Math.sin(a)*stepW;
+    let px = car.x, py = car.y;
+    for (let s=0;s<maxSteps;s++){
+      px += dx; py += dy;
+      const cx = Math.floor(px/GRID), cy = Math.floor(py/GRID);
+      if (cx<0||cy<0||cx>=cols||cy>=rows) break;
+      const k = cy*cols+cx;
+      visNow[k] = 1;
+      if (!grid.visited[k]){ grid.visited[k] = 1; exploredCells++; }
+      if (blocked[k] && k !== startK){ found.add(world.obstacles[owner[k]-1]); break; }
+    }
+  }
+  let grew = false;
+  for (const o of found){ if (knownObstacles.indexOf(o) < 0){ knownObstacles.push(o); grew = true; } }
+  /* 新障碍进入已知地图 → 重建占用网格(主线程侧;Worker 在 start/replan 时自带 known 重建) */
+  if (grew) grid.buildFromWorld();
+  perceptionDirty = grew;
+  fogDirty = true;
+  if (exploreVal) exploreVal.textContent = (exploredCells/(cols*rows)*100).toFixed(1) + '%';
+}
+function resetPerception(){
+  knownObstacles = [];
+  grid.visited = null;
+  lastPerceptionCar = { x:-1e9, y:-1e9 };
+  exploredCells = 0; perceptionDirty = false; fogDirty = true;
+  if (percVisNow) percVisNow.fill(0);
+  if (exploreVal) exploreVal.textContent = '0%';
+}
+/* 迷雾:未见=全黑;记忆=半透明(其中的障碍呈暗灰);本帧可见格透明 */
+let fogCv = null, fogCtx = null, fogImg = null;
+function paintFog(){
+  if (!fogCv){ fogCv = document.createElement('canvas'); fogCtx = fogCv.getContext('2d'); }
+  const cols = grid.cols, rows = grid.rows;
+  if (fogCv.width !== cols || fogCv.height !== rows){ fogCv.width = cols; fogCv.height = rows; fogImg = null; }
+  if (!fogImg) fogImg = fogCtx.createImageData(cols, rows);
+  const d = fogImg.data, visited = grid.visited, now = percVisNow, obsCells = percBlocked;
+  for (let i=0;i<cols*rows;i++){
+    const p = i*4;
+    if (now && now[i]){ d[p+3] = 0; continue; }                                 /* 看得见:不遮 */
+    if (visited && visited[i]){ d[p]=8; d[p+1]=11; d[p+2]=16; d[p+3]=158; }     /* 记忆:半透明 */
+    else if (obsCells && obsCells[i]){ d[p]=0; d[p+1]=0; d[p+2]=0; d[p+3]=180; } /* 没看到的障碍:黑灰轮廓 */
+    else { d[p]=0; d[p+1]=0; d[p+2]=0; d[p+3]=255; }                            /* 没看到的地面:全黑 */
+  }
+  fogCtx.putImageData(fogImg, 0, 0);
+}
 function tryReplan(force){
   const now = performance.now();
-  const cooldown = (force && persistChk.checked) ? 150 : 500;
+  /* 感知模式:已知区域持续增长,重规划更频繁 */
+  const cooldown = perceptionOn ? 250 : ((force && persistChk.checked) ? 150 : 500);
   if (now - lastReplanT < cooldown) return;
   if (!force && !frontBlocked(600)) return;
   lastReplanT = now;
   if (!algo) return;
-  if (algo.id === 'dlite' && algo.hasPlan){
-    // D* Lite:移动障碍改变网格 → 增量重规划
+  if (!perceptionOn && algo.id === 'dlite' && algo.hasPlan){
+    // D* Lite:移动障碍改变网格 → 增量重规划(感知模式下已知地图持续增长,增量前提不成立)
     grid.buildFromWorld();
     const after = blockedSet();
     const changed = diffBlocked(algo.blockedBefore, after);
@@ -3487,6 +3619,7 @@ function abortRun(msg){
   replanning = false; dynamicStart = null;
   pendingBatches.length = 0;
   visReset(); dliteDirty = false; btnReplan.disabled = true;
+  resetPerception();
   resetCarToStart();
   grid.buildFromWorld();
   if (msg) actionText(msg); else actionText('就绪:点击空地设置终点,或选工具编辑障碍物');
@@ -3501,6 +3634,7 @@ function handleEvents(ev){
 function afterWorldChange(){
   grid.buildFromWorld();
   updateCoverDisplay();
+  resetPerception(); /* 地图变了:记忆作废(感知模式下会立刻按新地图重算) */
   if (algo && algo.id === 'dlite' && algo.hasPlan && (mode === 'idle' || mode === 'arrived' || mode === 'following')){
     dliteDirty = true; btnReplan.disabled = false;
     actionText('地图已变化,可点击"重规划"增量修复路径');
@@ -4028,6 +4162,14 @@ function render(){
     }
   }
   drawAlgoLayers(c2, view);
+  // 视线限制:盖住未见区域(本帧可见=透明,记忆=半透明,从未看到=全黑)
+  if (perceptionOn){
+    if (fogDirty){ paintFog(); fogDirty = false; }
+    c2.save();
+    c2.imageSmoothingEnabled = false;
+    c2.drawImage(fogCv, 0, 0, W, H);
+    c2.restore();
+  }
   // 拖拽放置预览
   if (mouse.mode === 'place' && mouse.startW && mouse.curW){
     const x = Math.min(mouse.startW.x,mouse.curW.x), y = Math.min(mouse.startW.y,mouse.curW.y);
@@ -4141,6 +4283,9 @@ function loop(t){
   // 相机跟随(行驶/重规划巡航期间始终跟随车,避免视角跳变)
   if (mode === 'following' || (replanning && mode === 'searching')){ cam.x = car.x; cam.y = car.y; }
   updateMovingObstacles(dt);
+  /* 感知:按当帧障碍位置重算阴影与记忆;新看到障碍 → 触发重规划 */
+  updatePerception();
+  if (perceptionDirty && mode === 'following') tryReplan(true);
   render();
   syncPlaybackUI();
 }
@@ -4327,6 +4472,22 @@ btnClearPatrol.addEventListener('click', () => {
 });
 document.querySelectorAll('input[name=path]').forEach(r => r.addEventListener('change', () => { pathMode = document.querySelector('input[name=path]:checked').value; }));
 document.querySelectorAll('input[name=pathStyle]').forEach(r => r.addEventListener('change', () => { pathStyle = document.querySelector('input[name=pathStyle]:checked').value; }));
+/* 感知:视角切换 / 视野半径 / 未知区代价 */
+document.querySelectorAll('input[name=perception]').forEach(r => r.addEventListener('change', () => {
+  perceptionOn = document.querySelector('input[name=perception]:checked').value === 'on';
+  resetPerception();
+  grid.buildFromWorld(); /* 网格随视角在"真实障碍 ⇄ 已知障碍"之间切换 */
+  updatePerception();
+  fogDirty = true;
+  actionText(perceptionOn ? '视线限制已开启:只显示小车看得见的区域(记忆区见灰)' : '已切换到上帝视角:恢复完整地图');
+}));
+visRRange.addEventListener('input', () => {
+  visR = +visRRange.value; visRVal.textContent = visRRange.value;
+  lastPerceptionCar = { x:-1e9, y:-1e9 }; /* 车静止时也按新半径重算可见区 */
+});
+unknownCostRange.addEventListener('input', () => {
+  UNKNOWN_COST = +unknownCostRange.value; unknownCostVal.textContent = unknownCostRange.value + '×';
+});
 btnReplan.addEventListener('click', doReplan);
 btnReset.addEventListener('click', () => {
   abortRun();
@@ -4414,6 +4575,11 @@ if (IS_WORKER){
       start.x = msg.start.x; start.y = msg.start.y; start.theta = msg.start.theta || 0;
       car.x = start.x; car.y = start.y; car.theta = start.theta || 0;
       if (msg.apfSpeed !== undefined) APF_SPEED = msg.apfSpeed;
+      /* 感知模式:只保留已见障碍与已探索格;未知区可通行但按 unknownCost 加价 */
+      perceptionOn = !!msg.perception;
+      knownObstacles = msg.known || [];
+      UNKNOWN_COST = msg.unknownCost || 4;
+      grid.visited = msg.visited || null;
       grid.buildFromWorld(); /* 吸附与算法 init 都依赖网格 */
       dynamicStart = msg.dynamicStart || null;
       if (dynamicStart){
@@ -4430,6 +4596,10 @@ if (IS_WORKER){
       if (ok !== false) workerRun(curAlgo, curAlgo.id !== 'dlite');
     } else if (msg.cmd === 'replanDlite'){
       world.obstacles = msg.obstacles;
+      perceptionOn = !!msg.perception;
+      knownObstacles = msg.known || [];
+      UNKNOWN_COST = msg.unknownCost || 4;
+      grid.visited = msg.visited || null;
       grid.buildFromWorld();
       curAlgo.blockedBefore = msg.blockedBefore;
       curAlgo.replan(msg.changed);
@@ -4444,6 +4614,7 @@ if (!IS_WORKER){
 resizeCanvas();
 generateObstacles(0.12);
 grid.buildFromWorld();
+resetPerception();
 setupWorkers();
 updateCoverDisplay();
 renderMetrics(); /* 初始即显示空态提示 */
